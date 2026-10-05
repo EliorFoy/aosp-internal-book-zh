@@ -36,7 +36,11 @@ future revisions of the source tree. The reader is encouraged to verify
 references against their own checked-out source.
 
 **Disclaimer**: The information in this book is provided on an "as is" basis,
-without warranty. The author made every effort to make the information accurate through direct source code verification. Even so, neither the author nor the publisher shall have any liability to any person or entity for any loss or damage. This applies to loss or damage caused, or alleged to be caused, directly or indirectly by the information contained in this book.
+without warranty. While every effort has been made to ensure accuracy through
+direct source code verification, neither the author nor the publisher shall have
+any liability to any person or entity with respect to any loss or damage caused
+or alleged to be caused directly or indirectly by the information contained in
+this book.
 
 **Source tree baseline**: AOSP `main` / `android17-release` (Android 17, API
 level 37, codename Cinnamon Bun), synced mid-2026.
