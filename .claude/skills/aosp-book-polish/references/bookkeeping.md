@@ -36,7 +36,7 @@ regardless of which Part it joins). Then wire it everywhere:
 - **`docs/` symlink** — `ln -sf ../<slug>.md docs/<slug>.md` (docs/ is gitignored
   and CI regenerates it, but it must exist locally for `properdocs build`).
 - **`README.md`** — add a row to the "What This Book Covers" table; bump the
-  chapter count in surrounding prose and the `./serve.sh pdf` line.
+  chapter count in surrounding prose.
 - **`llms.txt`** — add a `- [Chapter N: Title](https://.../<slug>/): one-line
   description` entry under the right Part heading.
 - Run all the gates above.
