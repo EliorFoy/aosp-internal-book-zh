@@ -1,1 +1,0 @@
-../../../_content/parts/device-support/SKILL.md

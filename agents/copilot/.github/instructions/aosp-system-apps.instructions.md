@@ -1,1 +1,0 @@
-../../../_generated/parts/system-apps.md

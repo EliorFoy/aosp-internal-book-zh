@@ -1,1 +1,0 @@
-../../../_content/parts/kernel-and-boot/SKILL.md

@@ -1,1 +1,0 @@
-../../../_content/parts/ai-and-devices/SKILL.md

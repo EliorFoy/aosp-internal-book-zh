@@ -1,1 +1,0 @@
-../../../_content/parts/ui-framework/SKILL.md

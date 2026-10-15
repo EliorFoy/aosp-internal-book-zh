@@ -1,1 +1,0 @@
-../../../_content/parts/framework-core/SKILL.md

@@ -158,6 +158,6 @@ subsystem.
 ## Step 4 — Bookkeeping for new chapters/Parts
 
 Only if Step 2 added a chapter or Part — see `references/bookkeeping.md`.
-Folds and notes into existing chapters need only the standard Phase D
-regeneration (`build.py`) and gates; they do not touch `manifest.toml`/nav/
-README/`llms.txt` (within-scope additions, per CLAUDE.md rule 11).
+Folds and notes into existing chapters need only the standard Phase D gates;
+they do not touch nav/README/`llms.txt` (within-scope additions, per CLAUDE.md
+rule 11).

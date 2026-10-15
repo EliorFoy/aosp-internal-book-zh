@@ -1,1 +1,0 @@
-../../../../24-display-system.md

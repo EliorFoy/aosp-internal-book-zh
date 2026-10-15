@@ -1,1 +1,0 @@
-../../../_content/parts/native-services-and-media/SKILL.md

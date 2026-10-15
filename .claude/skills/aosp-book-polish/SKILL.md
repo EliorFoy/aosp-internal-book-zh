@@ -2,7 +2,7 @@
 name: aosp-book-polish
 description: >-
   Update or polish the AOSP Internals reference book (the chapters at the repo
-  root -- NN-slug.md -- plus the appendices and the generated agents/ Part-skills)
+  root -- NN-slug.md -- plus the appendices and the llms.txt index)
   so it is accurate and current for a newly-synced or newer AOSP/Android source
   tree. Use this whenever the user says anything like "polish the book for
   Android NN", "update the reference book to the new AOSP version", "the AOSP
@@ -53,7 +53,8 @@ the new-module gap analysis.
   / removed projects — the seed for Phase C).
 - **Book conventions** — `book/CLAUDE.md` (the writing rules; these are
   non-negotiable), `.claude/skills/book-writer/SKILL.md` (chapter structure +
-  Mermaid syntax), `agents/_content/manifest.toml` (Part → chapter mapping),
+  Mermaid syntax), `llms.txt` and the `README.md` coverage table (Part → chapter
+  mapping),
   existing chapters as style exemplars.
 - **The Android-NN appendix** (e.g. `D-appendix-android-17-updates.md`) — a
   curated map of the new version's changes; a per-chapter checklist of what to
@@ -169,17 +170,13 @@ procedure is in `references/new-modules.md`. In brief:
 After chapters reach convergence, and after any new chapter/Part. Full checklist
 in `references/bookkeeping.md`. Gates that must be green:
 
-- `python3 agents/build.py` regenerated and `agents/build.py --check` exits 0
-  (content changes stale the Part-skills — rule 12).
 - `properdocs build` succeeds **in the project Docker image** (a local
   `properdocs` fails on the `!!python` tag — that's environmental, not your
   error).
 - Every touched chapter `./serve.sh png` reports `errors=0`.
 - No local-path/username leaks anywhere in the touched files.
-- New chapter only: `manifest.toml`, `properdocs.yml` nav, the `docs/` symlink,
-  `README.md` + `agents/README.md` counts/tables, and `llms.txt` updated; a new
-  Part also needs a hand-authored `agents/_content/parts/<id>/SKILL.md` before
-  `build.py` will run.
+- New chapter only: `properdocs.yml` nav, the `docs/` symlink, the `README.md`
+  counts/table, and `llms.txt` updated.
 
 ## Agent-team orchestration (≤10 by default)
 
@@ -207,13 +204,6 @@ staged**, and use a plain commit (no `Co-Authored-By` trailer — CLAUDE.md rule
 
 ## Gotchas learned the hard way
 
-- **`git checkout -- agents/` reverts your manifest + Part templates.**
-  `manifest.toml` and `agents/_content/parts/*/SKILL.md` live under `agents/`, so
-  a blanket checkout to clear a subagent's stray `build.py` regen also wipes your
-  bookkeeping. Revert only the generated platform trees, or re-apply + regenerate.
-- **A new Part needs its source template first.** `build.py` fails with
-  "Missing SKILL.md for part <id>" until you hand-author
-  `agents/_content/parts/<id>/SKILL.md` (copy an existing Part's as a model).
 - **The dup-section gate must use full tokens.** A regex like `^#{2,3} N\.[0-9]+`
   mis-flags 4-level numbers (`N.1.5.1` → "N.1.5"). Match the whole token:
   `^#{2,4} N\.[0-9]+(\.[0-9]+){0,3}` then `sort | uniq -d`.

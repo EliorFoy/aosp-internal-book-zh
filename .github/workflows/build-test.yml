@@ -8,7 +8,6 @@ on:
       - '**.png'
       - 'properdocs.yml'
       - 'llms.txt'
-      - 'agents/**'
       - '.github/workflows/build-test.yml'
   pull_request:
     branches: [main]
@@ -48,6 +47,3 @@ jobs:
         run: |
           echo "Pages: $(find site -name '*.html' | wc -l)"
           echo "Size: $(du -sh site/ | cut -f1)"
-
-      - name: Verify agents/ packages are in sync with chapter sources
-        run: python3 agents/build.py --check

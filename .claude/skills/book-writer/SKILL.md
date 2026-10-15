@@ -30,7 +30,7 @@ The book is served via ProperDocs (a MkDocs fork) with the Material theme. When 
    - [Chapter N: Title](https://aospbooks.github.io/aosp-internal-book/NN-slug/): one-line description of what the chapter covers
    ```
 5. If the chapter number changes existing chapters, renumber the affected `properdocs.yml` entries and `llms.txt` URLs too
-6. Add the new chapter slug to `agents/_content/manifest.toml` under the right Part (and create a new Part entry there + `agents/_content/parts/<slug>/SKILL.md` if the chapter belongs to a brand-new Part), then run `python3 agents/build.py` and commit the regenerated `agents/<platform>/` trees.
+6. Add a row to the chapter table in `README.md` and update the chapter counts (CLAUDE.md rule 13)
 
 ### When you remove a chapter
 
@@ -39,7 +39,7 @@ The book is served via ProperDocs (a MkDocs fork) with the Material theme. When 
 3. Remove the symlink from `docs/`
 4. Remove the matching `llms.txt` entry
 5. Renumber subsequent chapters if needed (in filenames, `properdocs.yml`, `llms.txt`, and section headings inside the files)
-6. Remove the chapter slug from `agents/_content/manifest.toml`, then run `python3 agents/build.py` and commit the regenerated `agents/<platform>/` trees.
+6. Remove the row from the chapter table in `README.md` and update the chapter counts
 
 ### When you rename or reorder chapters
 
@@ -48,7 +48,7 @@ The book is served via ProperDocs (a MkDocs fork) with the Material theme. When 
 3. Update the `docs/` symlink
 4. Update the `llms.txt` entry (label, URL slug, and the one-line description if scope changed)
 5. Update all `## N.x` section headings inside the file to match the new chapter number
-6. Update the chapter slug in `agents/_content/manifest.toml` (and the relevant Part's `SKILL.md` description if scope shifted), then run `python3 agents/build.py` and commit the regenerated `agents/<platform>/` trees.
+6. Update the row in the chapter table in `README.md`
 
 ### properdocs.yml nav structure
 

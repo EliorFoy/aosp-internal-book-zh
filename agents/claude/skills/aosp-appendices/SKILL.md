@@ -1,1 +1,0 @@
-../../../_content/parts/appendices/SKILL.md

@@ -1,1 +1,0 @@
-../../../_generated/parts/kernel-and-boot.md

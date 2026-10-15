@@ -6,8 +6,8 @@ Goal: a `queue.json` ordered so the most-changed chapters land first.
 
 1. Read the changeset `report.md` (per-repo `new`/`dropped` counts) and the
    new-version appendix.
-2. Map each subsystem to its chapter(s) via `agents/_content/manifest.toml`
-   (Part → chapters).
+2. Map each subsystem to its chapter(s) via `llms.txt` (chapters grouped by
+   Part, each with a one-line scope).
 3. Score each chapter = sum of NEW commits across its repos + count of new
    modules touching it. Sort descending → `queue.json`.
 4. Initialize `state.json` with every chapter `pending` (plus any new chapters

@@ -1,1 +1,0 @@
-../../../_content/parts/system-apps/SKILL.md

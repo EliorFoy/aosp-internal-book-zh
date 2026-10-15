@@ -1,1 +1,0 @@
-../../_generated/parts/device-support.md

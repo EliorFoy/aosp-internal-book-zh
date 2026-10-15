@@ -80,10 +80,3 @@ is the source of truth.
   `.superpowers/book-polish/backups/<slug>.bak.md` — once, never overwriting an
   existing `.bak`. This is the diff base and the restore point if a rewrite is
   judged worse than the original.
-
-## Regeneration coupling (why Phase D exists)
-
-- The 16+ Part-skills under `agents/<claude|gemini|codex|copilot>/` are generated
-  from the root chapters by `agents/build.py`. ANY chapter content change stales
-  them — regenerate and let `build.py --check` pass (CI enforces it). See
-  `references/bookkeeping.md`.

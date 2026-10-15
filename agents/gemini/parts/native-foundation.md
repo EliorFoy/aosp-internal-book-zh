@@ -1,1 +1,0 @@
-../../_generated/parts/native-foundation.md

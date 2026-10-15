@@ -1,1 +1,0 @@
-../../../_content/parts/native-foundation/SKILL.md

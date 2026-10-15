@@ -1,1 +1,0 @@
-../../_generated/parts/ai-and-devices.md

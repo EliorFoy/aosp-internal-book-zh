@@ -6,7 +6,7 @@ A comprehensive technical book covering the full AOSP stack — from kernel to a
 
 **Read online:** <https://aospbooks.github.io/aosp-internal-book/>
 
-**Using AI?** Point your assistant at <https://aospbooks.github.io/aosp-internal-book/llms.txt> — an [llmstxt.org](https://llmstxt.org/)-style index that lets the model find the right chapter for any AOSP subsystem without crawling the whole site.
+**Using AI?** No plugin or skill pack is needed. Give your coding agent the short prompt in [Using the Book with AI Agents](#using-the-book-with-ai-agents); it reads [`llms.txt`](https://aospbooks.github.io/aosp-internal-book/llms.txt) and fetches only the chapters it needs.
 
 > If you spot errors, missing details, or have suggestions, please [open an issue](https://github.com/aospbooks/aosp-internal-book/issues) or submit a pull request — feedback from AOSP developers and enthusiasts is very welcome.
 
@@ -90,6 +90,45 @@ A comprehensive technical book covering the full AOSP stack — from kernel to a
 | App. | D | Android 17 Updates |
 <!-- --8<-- [end:coverage] -->
 
+## Using the Book with AI Agents
+
+The book needs no plugin, skill, or extension. Any coding agent that can fetch a
+URL or read files (Claude Code, Codex, Gemini CLI, GitHub Copilot, Cursor, and
+others) can use it directly. The entry point is
+[`llms.txt`](https://aospbooks.github.io/aosp-internal-book/llms.txt), an
+[llmstxt.org](https://llmstxt.org/)-style index that lists every chapter and
+appendix with a one-line summary and its URL, grouped by Part. The agent reads
+the index first and then fetches only the chapters that match your question.
+
+**From the website.** Paste this into your prompt, or into the agent's project
+instructions (`CLAUDE.md`, `AGENTS.md`, `GEMINI.md`,
+`.github/copilot-instructions.md`) to make it permanent:
+
+```text
+Use the AOSP Internals book as reference material.
+1. Fetch https://aospbooks.github.io/aosp-internal-book/llms.txt. It lists every
+   chapter with a one-line summary and its URL.
+2. Fetch only the chapters that cover the subsystem in question. Do not crawl
+   the whole site.
+3. Cite chapter and section numbers (for example "section 9.4.2") in answers.
+4. The book cites AOSP source as tree-relative paths with line numbers. Check a
+   path against the source tree or https://cs.android.com before you rely on it.
+```
+
+**From a local clone.** This works offline and lets the agent search every
+chapter at once:
+
+```bash
+git clone https://github.com/aospbooks/aosp-internal-book.git
+```
+
+```text
+The AOSP Internals book is cloned at <path>. Read <path>/llms.txt to find the
+right chapter, then read that chapter's Markdown file (<path>/NN-slug.md, for
+example 09-binder-ipc.md) directly. Search the *.md files when you need every
+mention of a class, file, or property.
+```
+
 ## How to Give Feedback
 
 - **Found an error?** Open an issue describing the chapter, section, and what's wrong.
@@ -170,7 +209,8 @@ docker-compose.yml         serve / build-site / build-pdf / build-epub
 tools/                     Helper scripts (manifest_snapshot.py + tests)
 manifest-snapshots/        Pinned AOSP manifests by branch/date + comparison reports
 CLAUDE.md                  Project rules for AI agents
-.claude/skills/            book-writer
+.claude/skills/            Maintainer skills: book-writer, aosp-book-polish, aosp-version-diff
+llms.txt                   llmstxt.org index of every chapter, for AI agents
 .github/workflows/         CI: properdocs build test
 ```
 

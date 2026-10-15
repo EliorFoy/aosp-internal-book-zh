@@ -1,1 +1,0 @@
-../../../_content/parts/connectivity/SKILL.md
