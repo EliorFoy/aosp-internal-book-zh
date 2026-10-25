@@ -20,11 +20,16 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 20
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -32,9 +37,6 @@ jobs:
           node-version: '22'
           cache: 'pnpm'
           cache-dependency-path: docs-site/pnpm-lock.yaml
-
-      - name: Setup pnpm
-        run: npm install -g pnpm
 
       - name: Install dependencies
         working-directory: docs-site
