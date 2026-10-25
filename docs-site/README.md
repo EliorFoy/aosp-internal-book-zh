@@ -45,3 +45,5 @@ resources:
   features and API.
 - [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
 - [Fumadocs](https://fumadocs.dev) - learn about Fumadocs
+
+<!-- deploy trigger 10/25/2026 15:57:25 -->
