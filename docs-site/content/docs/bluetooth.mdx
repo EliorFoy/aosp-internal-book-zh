@@ -1,0 +1,3307 @@
+---
+title: "第 37 章：蓝牙"
+description: "蓝牙是 AOSP 中功能最丰富的子系统之一。"
+---
+
+# 第 37 章：蓝牙
+
+蓝牙是 AOSP 中功能最丰富的子系统之一。它包含经典蓝牙（BR/EDR）和低功耗蓝牙
+（BLE）。它还拥有数十种配置文件、完整的原生 HCI 协议栈，并与音频和电话框架
+深度集成。Android 的蓝牙实现主要位于 `packages/modules/Bluetooth/`，作为可
+更新的 APEX 模块（`com.android.bt`）发布。
+
+本章追踪每一层。它从 Java 框架 API 开始，向下贯穿原生的
+Gabeldorsche/Fluoride 协议栈，最终到达与控制器固件通信的 AIDL HAL。
+
+---
+
+## 37.1 蓝牙架构
+
+### 37.1.1 高层概述
+
+Android 的蓝牙协议栈按垂直分层组织。顶部的应用程序使用公共 SDK 类。这些类
+通过 AIDL binder 调用委托给一个特权系统服务。该服务驱动一个原生
+C++/Rust 协议栈。该协议栈通过供应商 HAL 向硬件发送 HCI。
+
+```mermaid
+graph TB
+    subgraph "Application Layer"
+        APP["Third-Party App"]
+    end
+
+    subgraph "Framework API Layer"
+        BM["BluetoothManager"]
+        BA["BluetoothAdapter"]
+        BD["BluetoothDevice"]
+        PROF["Profile Proxies<br/>(BluetoothA2dp, BluetoothHeadset,<br/>BluetoothGatt, ...)"]
+    end
+
+    subgraph "System Service Layer (Bluetooth APEX)"
+        BMS["BluetoothManagerService<br/>(BluetoothService.kt)"]
+        AS["AdapterService"]
+        PS["Profile Services<br/>(A2dpService, HeadsetService,<br/>GattService, ...)"]
+    end
+
+    subgraph "Native Stack Layer"
+        BTIF["BTIF (Bluetooth Interface)"]
+        BTA["BTA (Bluetooth Application)"]
+        STACK["Stack Core<br/>(L2CAP, SDP, SMP, GATT,<br/>AVDTP, AVRCP, RFCOMM)"]
+        GD["Gabeldorsche (GD) Modules<br/>(HCI, ACL, Advertising,<br/>Scanning, Storage)"]
+    end
+
+    subgraph "HAL Layer"
+        HAL["IBluetoothHci (AIDL HAL)"]
+    end
+
+    subgraph "Hardware"
+        CTRL["Bluetooth Controller<br/>(Firmware)"]
+    end
+
+    APP --> BM
+    BM --> BA
+    BA --> BD
+    BA --> PROF
+    PROF --> BMS
+    BMS --> AS
+    AS --> PS
+    PS --> BTIF
+    BTIF --> BTA
+    BTA --> STACK
+    STACK --> GD
+    GD --> HAL
+    HAL --> CTRL
+```
+
+### 37.1.2 BluetoothManager
+
+`BluetoothManager` 是应用程序的系统服务入口点。它被注解为
+`@SystemService(Context.BLUETOOTH_SERVICE)`。它通过
+`Context.getSystemService()` 获取。
+
+源文件：`packages/modules/Bluetooth/framework/java/android/bluetooth/BluetoothManager.java`
+
+```java
+@SystemService(Context.BLUETOOTH_SERVICE)
+@RequiresFeature(PackageManager.FEATURE_BLUETOOTH)
+public final class BluetoothManager {
+    private final BluetoothAdapter mAdapter;
+    private final Context mContext;
+
+    /** @hide */
+    public BluetoothManager(Context context) {
+        mContext = context.createDeviceContext(Context.DEVICE_ID_DEFAULT);
+        mAdapter = BluetoothAdapter.createAdapter(mContext);
+    }
+
+    @RequiresNoPermission
+    public BluetoothAdapter getAdapter() {
+        return mAdapter;
+    }
+    // ...
+}
+```
+
+`BluetoothManager` 提供三项主要功能：
+
+1. **适配器访问** —— `getAdapter()` 返回本地蓝牙控制器的单例
+   `BluetoothAdapter`。
+2. **GATT 连接状态** —— `getConnectionState()` 和
+   `getConnectedDevices()` 报告 BLE GATT 连接状态。
+3. **GATT 服务器创建** —— `openGattServer()` 实例化一个
+   `BluetoothGattServer`，用于托管本地服务。
+
+### 37.1.3 BluetoothAdapter
+
+`BluetoothAdapter` 是所有蓝牙操作的核心 API 类。它代表本地蓝牙无线电，是
+发现、配对、配置文件连接和 BLE 操作的起始点。
+
+源文件：`packages/modules/Bluetooth/framework/java/android/bluetooth/BluetoothAdapter.java`
+
+关键状态常量定义了适配器的生命周期：
+
+```java
+public static final int STATE_OFF = 10;
+public static final int STATE_TURNING_ON = 11;
+public static final int STATE_ON = 12;
+public static final int STATE_TURNING_OFF = 13;
+public static final int STATE_BLE_TURNING_ON = 14;   // @hide
+public static final int STATE_BLE_ON = 15;            // @SystemApi
+public static final int STATE_BLE_TURNING_OFF = 16;   // @hide
+```
+
+适配器状态机有两层“开启”。`STATE_BLE_ON` 仅启用 BLE 子系统（广播、扫描）。
+`STATE_ON` 还额外激活经典 BR/EDR 传输和所有配置文件。
+
+```mermaid
+stateDiagram-v2
+    [*] --> STATE_OFF
+    STATE_OFF --> STATE_BLE_TURNING_ON : enable
+    STATE_BLE_TURNING_ON --> STATE_BLE_ON : BLE ready
+    STATE_BLE_ON --> STATE_TURNING_ON : profile startup
+    STATE_TURNING_ON --> STATE_ON : all profiles ready
+    STATE_ON --> STATE_TURNING_OFF : disable
+    STATE_TURNING_OFF --> STATE_BLE_ON : profiles stopped
+    STATE_BLE_ON --> STATE_BLE_TURNING_OFF : BLE shutdown
+    STATE_BLE_TURNING_OFF --> STATE_OFF : complete
+```
+
+`BluetoothAdapter` 上的关键方法：
+
+| 方法 | 用途 |
+|--------|---------|
+| `enable()` / `disable()` | 开启/关闭蓝牙（需要 `BLUETOOTH_CONNECT`） |
+| `startDiscovery()` | 开始扫描附近的 BR/EDR 设备 |
+| `getBondedDevices()` | 返回已配对设备的集合 |
+| `getBluetoothLeScanner()` | 获取 BLE 扫描器 |
+| `getBluetoothLeAdvertiser()` | 获取 BLE 广播器 |
+| `listenUsingRfcommWithServiceRecord()` | 创建 RFCOMM 服务器套接字 |
+| `listenUsingL2capChannel()` | 创建 L2CAP CoC 服务器套接字 |
+| `getProfileProxy()` | 绑定到配置文件服务（A2DP、HFP 等） |
+| `getRemoteDevice()` | 从 MAC 地址创建 `BluetoothDevice` |
+| `nameForState()` | 将状态整数转换为人类可读的字符串 |
+
+### 37.1.4 BluetoothManagerService 和 BluetoothService
+
+在系统服务器端，`BluetoothService`（Kotlin）引导蓝牙子系统。它是一个
+`SystemService`，创建一个处理线程，构建一个 `BluetoothSupervisor`，并发布
+binder 服务。
+
+源文件：`packages/modules/Bluetooth/service/src/BluetoothService.kt`
+
+```kotlin
+class BluetoothService(context: Context) : SystemService(context) {
+    private val looper = HandlerThread("BluetoothSystemServer").apply { start() }.looper
+
+    private var supervisor: BluetoothSupervisor
+
+    init {
+        val bluetoothComponent = BluetoothComponent(context)
+        supervisor =
+            if (Flags.systemServerMigrateBmsToKotlin()) {
+                BluetoothSupervisorNew(context, looper, bluetoothComponent)
+            } else {
+                BluetoothSupervisorLegacy(context, looper, bluetoothComponent)
+            }
+        // ...
+    }
+
+    override fun onStart() {
+        publishBinderService(SERVICE_NAME, ServerBinder(looper, supervisor.api, context))
+    }
+}
+```
+
+一个功能标志（`Flags.systemServerMigrateBmsToKotlin()`，aconfig
+`system_server_migrate_bms_to_kotlin`）在 Kotlin 迁移落地期间，用于在新的和
+旧的 supervisor 实现之间进行选择。`BluetoothComponent` 保存解析后的蓝牙应用
+包/组件名称，并验证设备配置；用户限制处理位于单独的 `BluetoothRestriction`
+类中，与它一起初始化。
+
+`BluetoothManagerService` 是承担繁重工作的 Java 类。它绑定到
+`AdapterService`。它还管理开启/关闭状态转换、崩溃恢复（最多重试 6 次）、
+飞行模式集成和用户切换。
+
+源文件：`packages/modules/Bluetooth/service/src/com/android/server/bluetooth/BluetoothManagerService.java`
+
+`BluetoothManagerService` 的关键设计特性：
+
+- **崩溃恢复**：在 `mCrashTimestamps` 中跟踪崩溃时间戳，以
+  `SERVICE_RESTART_DELAY`（`Duration.ofMillis(400)`）退避——乘以重试计数器——
+  最多重启服务 `MAX_ERROR_RESTART_RETRIES`（6）次。
+- **状态管理**：使用 `BluetoothAdapterState`（基于 Kotlin 流）来跟踪和等待
+  适配器状态转换，并支持超时。
+- **处理程序消息**：所有状态转换都通过 `BluetoothHandler` 消息序列化，例如
+  `MESSAGE_BLUETOOTH_SERVICE_CONNECTED`、`MESSAGE_BLUETOOTH_STATE_CHANGE`、
+  `MESSAGE_TIMEOUT_BIND`。
+- **飞行模式**：与 `AirplaneModeListener` 和 `SatelliteModeListener` 集成，
+  用于无线电状态管理。
+
+源文件：`packages/modules/Bluetooth/service/src/AdapterState.kt`
+
+```kotlin
+class BluetoothAdapterState {
+    private val _uiState = MutableSharedFlow<Int>(1)
+
+    init { set(State.OFF) }
+
+    fun set(s: Int) = runBlocking {
+        _uiState.emit(s)
+        if (!disableCacheForTesting) {
+            IpcDataCache.invalidateCache(IPC_CACHE_MODULE_SYSTEM, GET_SYSTEM_STATE_API)
+        }
+    }
+
+    fun get(): Int = _uiState.replayCache.get(0)
+
+    suspend fun waitForState(timeout: Duration, vararg states: Int): Boolean =
+        withTimeoutOrNull(timeout) {
+            _uiState.filter { states.contains(it) }.first()
+        } != null
+}
+```
+
+### 37.1.5 AdapterService
+
+`AdapterService` 是运行在蓝牙 APK（`com.android.bluetooth`）内的 Android
+`Service`。它是 Java 世界与原生 C++ 协议栈之间的桥梁。每个配置文件服务都向
+它注册，它管理蓝牙协议栈的整体生命周期。
+
+源文件：`packages/modules/Bluetooth/android/app/src/com/android/bluetooth/btservice/AdapterService.java`
+
+`AdapterService` 导入并协调所有配置文件服务：
+
+```java
+import com.android.bluetooth.a2dp.A2dpService;
+import com.android.bluetooth.a2dpsink.A2dpSinkService;
+import com.android.bluetooth.avrcp.AvrcpTargetService;
+import com.android.bluetooth.avrcpcontroller.AvrcpControllerService;
+import com.android.bluetooth.bas.BatteryService;
+import com.android.bluetooth.bass_client.BassClientService;
+import com.android.bluetooth.csip.CsipSetCoordinatorService;
+import com.android.bluetooth.gatt.GattService;
+import com.android.bluetooth.hap.HapClientService;
+import com.android.bluetooth.hearingaid.HearingAidService;
+import com.android.bluetooth.hfp.HeadsetService;
+import com.android.bluetooth.hfpclient.HeadsetClientService;
+import com.android.bluetooth.hid.HidDeviceService;
+import com.android.bluetooth.hid.HidHostService;
+// ... and more
+```
+
+### 37.1.6 蓝牙 APEX 模块
+
+自 Android 12 起，蓝牙协议栈以 APEX 容器（`com.android.bt`）中的可更新主线
+模块形式发布。这使 Google 能够通过 Google Play 系统更新推送蓝牙安全补丁和
+功能更新，而无需完整的 OTA。
+
+目录：`packages/modules/Bluetooth/apex/`
+
+APEX 打包了：
+
+- 框架 JAR（`android.bluetooth` 包）
+- 蓝牙 APK（`com.android.bluetooth`）
+- 原生共享库（C++/Rust 协议栈）
+- 配置文件（`bt_did.conf` 等）
+- 系统服务（`BluetoothService`）
+
+### 37.1.7 权限模型
+
+Android 12+ 引入了细粒度蓝牙权限，以取代旧的 `BLUETOOTH` 和
+`BLUETOOTH_ADMIN` 权限：
+
+| 权限 | 用途 |
+|------------|---------|
+| `BLUETOOTH_CONNECT` | 连接到已配对的设备，访问设备信息 |
+| `BLUETOOTH_SCAN` | 发现附近设备（可能推断位置） |
+| `BLUETOOTH_ADVERTISE` | 使设备对其他人可见 |
+| `BLUETOOTH_PRIVILEGED` | 仅限系统的特权操作 |
+
+框架 API 类使用自定义注解来强制执行这些权限：
+
+```java
+@RequiresBluetoothConnectPermission
+@RequiresPermission(BLUETOOTH_CONNECT)
+public Set<BluetoothDevice> getBondedDevices() { ... }
+```
+
+---
+
+## 37.2 蓝牙协议栈
+
+### 37.2.1 协议栈演进：从 Fluoride 到 Gabeldorsche
+
+Android 的蓝牙原生协议栈经历了一次重大的架构演进：
+
+**Fluoride**（Android 13 之前）是最初的 C++ 蓝牙协议栈，从博通的 BlueDroid
+演变而来。它采用单体设计，各层紧密耦合并使用全局状态。
+
+**Gabeldorsche**（GD）是现代替代品，采用模块化架构设计。GD 模块自底向上
+逐步取代 Fluoride 组件（首先是 HCI 层，然后是 ACL 管理，再是配置文件）。
+
+```mermaid
+graph LR
+    subgraph "Modern Stack (Gabeldorsche)"
+        GD_HAL["GD hal/"]
+        GD_HCI["GD hci/"]
+        GD_STORAGE["GD storage/"]
+        GD_CRYPTO["GD crypto_toolbox/"]
+        GD_OS["GD os/"]
+        GD_METRICS["GD metrics/"]
+    end
+
+    subgraph "Legacy Stack (Fluoride)"
+        F_BTA["bta/ (BT Application)"]
+        F_STACK["stack/ (Core Protocols)"]
+        F_BTIF["btif/ (BT Interface)"]
+        F_MAIN["main/ (Shim Layer)"]
+    end
+
+    GD_HAL --> GD_HCI
+    GD_HCI --> F_MAIN
+    F_MAIN --> F_BTA
+    F_BTA --> F_STACK
+    F_BTIF --> F_BTA
+```
+
+`main/shim/` 中的垫片层提供了桥梁。通过它，Fluoride 代码可以调用已迁移的
+GD 模块功能。
+
+### 37.2.2 源代码树布局
+
+原生蓝牙协议栈位于 `packages/modules/Bluetooth/system/`：
+
+```
+system/
+  gd/           # Gabeldorsche -- the modern modular stack
+    hal/         # HAL abstraction (AIDL/HIDL backends)
+    hci/         # HCI layer, controller, ACL manager
+    storage/     # Persistent device database
+    crypto_toolbox/  # Cryptographic primitives
+    os/          # OS abstraction (handler, alarm, etc.)
+    metrics/     # Bluetooth metrics collection
+    packet/      # Packet serialization framework
+  btif/          # Bluetooth Interface -- JNI bridge
+    src/         # btif_core.cc, btif_dm.cc, btif_av.cc, ...
+    avrcp/       # AVRCP target implementation
+  bta/           # Bluetooth Application layer
+    av/          # A2DP/AVRCP application layer
+    dm/          # Device management
+    gatt/        # GATT client/server application layer
+    hf_client/   # HFP client
+    hfp/         # HFP audio gateway
+    hh/          # HID host
+    hd/          # HID device
+    le_audio/    # LE Audio
+    pan/         # PAN profile
+    sdp/         # Service Discovery Protocol
+    sys/         # System manager
+  stack/         # Core protocol implementations
+    a2dp/        # A2DP codec handling
+    acl/         # ACL connection management
+    avct/        # AVCTP (AV Control Transport)
+    avdt/        # AVDTP (AV Distribution Transport)
+    avrc/        # AVRCP protocol
+    bnep/        # Bluetooth Network Encapsulation Protocol
+    btm/         # Bluetooth Manager (classic security)
+    btu/         # Bluetooth Upper layer
+    gatt/        # GATT protocol
+    hid/         # HID protocol
+    l2cap/       # L2CAP protocol
+    pan/         # PAN protocol
+    rfcomm/      # RFCOMM serial protocol
+    sdp/         # SDP protocol
+    smp/         # Security Manager Protocol (BLE)
+    srvc/        # GATT-based services (DIS, etc.)
+  audio_hal_interface/  # Audio HAL integration
+    aidl/        # AIDL audio HAL client
+  rust/          # Rust components
+    src/         # bluetooth_rs crate: le_audio (ISO + periodic-advertising sync), pdl, types modules
+    private_gatt/ # Rust GATT server (shares ATT channel with C++ via arbiter)
+    macros/      # Procedural-macro support
+  main/          # Stack initialization and shim layer
+    shim/        # GD-to-Fluoride shim
+  include/       # Public headers
+  osi/           # OS Interface abstraction
+  common/        # Common utilities
+```
+
+### 37.2.3 Gabeldorsche (GD) 模块细节
+
+`system/gd/` 中的 GD 模块使用一致的设计模式：每个模块定义抽象接口，并针对
+Android（生产）和主机（测试）分别提供实现。
+
+#### GD HAL 模块
+
+HAL 模块抽象了协议栈与控制器之间的传输。它支持两种后端：AIDL（现代）和
+HIDL（旧版）。
+
+源文件：`packages/modules/Bluetooth/system/gd/hal/hci_backend.h`
+
+```cpp
+namespace bluetooth::hal {
+
+class HciBackend {
+public:
+  static std::shared_ptr<HciBackend> CreateAidl();
+  static std::shared_ptr<HciBackend> CreateAidl(const std::string& hci_instance_name);
+  static std::shared_ptr<HciBackend> CreateHidl(::bluetooth::os::Handler*);
+
+  virtual ~HciBackend() = default;
+  virtual void initialize(std::shared_ptr<HciBackendCallbacks>) = 0;
+  virtual void sendHciCommand(const std::vector<uint8_t>&) = 0;
+  virtual void sendAclData(const std::vector<uint8_t>&) = 0;
+  virtual void sendScoData(const std::vector<uint8_t>&) = 0;
+  virtual void sendIsoData(const std::vector<uint8_t>&) = 0;
+};
+
+}  // namespace bluetooth::hal
+```
+
+`HciHal` 类（定义在 `hci_hal.h` 中）封装后端，并提供协议栈其余部分使用的
+接口：
+
+源文件：`packages/modules/Bluetooth/system/gd/hal/hci_hal.h`
+
+```cpp
+class HciHal {
+public:
+  virtual void registerIncomingPacketCallback(HciHalCallbacks* callback) = 0;
+  virtual void unregisterIncomingPacketCallback() = 0;
+  virtual void sendHciCommand(HciPacket command) = 0;
+  virtual void sendAclData(HciPacket data) = 0;
+  virtual void sendScoData(HciPacket data) = 0;
+  virtual void sendIsoData(HciPacket data) = 0;
+};
+```
+
+回调接口镜像了 HAL：
+
+```cpp
+class HciHalCallbacks {
+public:
+  virtual void hciEventReceived(HciPacket event) = 0;
+  virtual void aclDataReceived(HciPacket data) = 0;
+  virtual void scoDataReceived(HciPacket data) = 0;
+  virtual void isoDataReceived(HciPacket data) = 0;
+  virtual void controllerNeedsReset() {}
+};
+```
+
+#### GD HCI 模块
+
+HCI 模块处理控制器初始化、功能发现，并为各种 HCI 子系统提供管理器。
+
+源文件：`packages/modules/Bluetooth/system/gd/hci/controller_impl.h`
+
+`ControllerImpl` 通过 HCI 命令查询控制器能力，并将其暴露为布尔功能标志：
+
+```cpp
+class ControllerImpl : public Controller {
+public:
+  // Classic capabilities
+  virtual bool SupportsSimplePairing() const override;
+  virtual bool SupportsSecureConnections() const override;
+  virtual bool SupportsRoleSwitch() const override;
+  virtual bool SupportsSco() const override;
+
+  // BLE capabilities
+  virtual bool SupportsBle() const override;
+  virtual bool SupportsBleExtendedAdvertising() const override;
+  virtual bool SupportsBlePeriodicAdvertising() const override;
+  virtual bool SupportsBle2mPhy() const override;
+  virtual bool SupportsBleCodedPhy() const override;
+  virtual bool SupportsBlePrivacy() const override;
+  virtual bool SupportsBleConnectedIsochronousStreamCentral() const override;
+  virtual bool SupportsBleIsochronousBroadcaster() const override;
+  virtual bool SupportsBleChannelSounding() const override;
+
+  // Buffer information
+  virtual uint16_t GetAclPacketLength() const override;
+  virtual uint16_t GetNumAclPacketBuffers() const override;
+  virtual LeBufferSize GetLeBufferSize() const override;
+  virtual LeBufferSize GetControllerIsoBufferSize() const override;
+};
+```
+
+LE 事件掩码经过版本门控，以避免设置不受支持的位：
+
+```cpp
+static constexpr uint64_t kLeEventMask53 = 0x00000007ffffffff;  // BT 5.3
+static constexpr uint64_t kLeEventMask52 = 0x00000003ffffffff;  // BT 5.2
+static constexpr uint64_t kLeEventMask51 = 0x0000000000ffffff;  // BT 5.1
+static constexpr uint64_t kLeEventMask50 = 0x00000000000fffff;  // BT 5.0
+```
+
+GD HCI 模块还提供专门的管理器：
+
+| 管理器 | 源文件 | 用途 |
+|---------|--------|---------|
+| `LeAdvertisingManagerImpl` | `hci/le_advertising_manager_impl.h` | BLE 广播集管理 |
+| `LeScanningManagerImpl` | `hci/le_scanning_manager_impl.h` | 带过滤器的 BLE 扫描管理 |
+| `AclManagerClassicImpl` | `hci/acl_manager/acl_manager_classic_impl.h` | 经典 ACL 连接 |
+| `AclManagerLeImpl` | `hci/acl_manager/acl_manager_le_impl.h` | BLE ACL 连接 |
+| `LeAddressManager` | `hci/le_address_manager.h` | RPA 轮换与地址管理 |
+| `DistanceMeasurementManagerImpl` | `hci/distance_measurement_manager_impl.h` | 信道探测/测距 |
+
+#### GD 存储模块
+
+存储模块持久化配对信息、设备属性和适配器配置。它使用存储在磁盘上的配置文件
+格式（INI 风格）。
+
+源文件：`packages/modules/Bluetooth/system/gd/storage/storage_module.h`
+
+存储键定义为预处理器宏：
+
+源文件：`packages/modules/Bluetooth/system/gd/storage/config_keys.h`
+
+```cpp
+#define BTIF_STORAGE_SECTION_ADAPTER "Adapter"
+#define BTIF_STORAGE_KEY_ADDR_TYPE "AddrType"
+#define BTIF_STORAGE_KEY_ADDRESS "Address"
+#define BTIF_STORAGE_KEY_ALIAS "Aliase"
+#define BTIF_STORAGE_KEY_DEV_CLASS "DevClass"
+#define BTIF_STORAGE_KEY_DEV_TYPE "DevType"
+#define BTIF_STORAGE_KEY_HFP_VERSION "HfpVersion"
+#define BTIF_STORAGE_KEY_GATT_CLIENT_DB_HASH "GattClientDatabaseHash"
+// ... many more
+```
+
+### 37.2.4 Rust 组件
+
+Android 正在逐步将 Rust 引入蓝牙协议栈以提高内存安全性，Android 17 重组了
+这些组件。`packages/modules/Bluetooth/system/rust/` 下的 Rust 树现在包含
+三部分：
+
+```
+rust/
+  src/          # bluetooth_rs crate: le_audio (ISO manager + periodic-advertising sync), pdl, types modules
+  private_gatt/ # the Rust GATT server (moved out of src/ in 17)
+  macros/       # procedural-macro support
+```
+
+#### Rust GATT 服务器（private_gatt）
+
+Rust GATT 服务器与现有 C++ GATT 客户端共享 ATT 承载。在 Android 17 中，它从
+`system/rust/src/` 移到了位于 `system/rust/private_gatt/` 的独立 crate 中。
+它的全局状态被移除，因此不再依赖静态单例。
+
+源文件：`packages/modules/Bluetooth/system/rust/private_gatt/src/gatt.rs`
+
+```rust
+//! This module is a simple GATT server that shares the ATT channel with the
+//! existing C++ GATT client. See go/private-gatt-in-platform for the design.
+
+mod arbiter;
+mod callbacks;
+mod channel;
+mod ffi;
+mod ids;
+#[cfg(test)]
+mod mocks;
+mod mtu;
+mod opcode_types;
+mod server;
+```
+
+`arbiter` 按连接决定由哪一侧（C++ 或 Rust）处理传入的 ATT 流量。
+`IsolationManager` 将连接到达时所用的广播集（从而也是传输方式）映射到一个
+Rust 服务器。在这些连接上，仅拦截服务器端 ATT 操作码（命令、请求和确认，
+不包括 Exchange MTU Request）。其他所有内容都转发给 C++ 协议栈。`mtu` 模块
+实现 ATT MTU 交换，`ffi` 提供 C++ 互操作绑定（C++ 侧的
+`stack/arbiter/acl_arbiter.h`）。
+
+#### Rust LE Audio 模块
+
+更大的 Android 17 新增内容是 `bluetooth_rs` crate 的 `le_audio` 模块
+（位于 `system/rust/`，与 `pdl` 和 `types` 模块并列），在 `lib.rs` 中声明：
+
+源文件：`packages/modules/Bluetooth/system/rust/src/lib.rs`
+
+```rust
+pub mod le_audio;
+pub mod pdl;
+pub mod types;
+```
+
+`le_audio` 包含两个同步传输管理器，LE Audio 配置文件构建于其上。每个都有三
+个文件：`traits.rs`（接口）、`manager.rs`（实现）和 `ffi.rs`（到 C++ 垫片的
+`#[cxx::bridge]`）：
+
+| 模块 | 源文件 | 用途 |
+|--------|--------|---------|
+| ISO 管理器 | `system/rust/src/le_audio/iso_manager/` | 管理 CIG/CIS（连接）和 BIG/BIS（广播）同步组与流 |
+| 周期广播同步 | `system/rust/src/le_audio/periodic_advertising_sync/` | 同步到周期广播列车（PAST/PA 同步）并传递 BIGInfo 报告 |
+
+两个管理器都构建在 Tokio 异步原语之上。`oneshot`/`mpsc`/`broadcast` 通道
+协调命令完成与事件流。Arc 包装资源的 `Drop` 实现会触发异步拆除（RAII）。
+
+句柄类型（`CigId`、`CisId`、`BigHandle`、`SyncHandle`、
+`IsoConnectionHandle`）是新型类型包装器，用于屏蔽控制器的保留位。周期广播
+间隔等时间值被建模为 `std::time::Duration`，而不是原始 HCI 1.25 毫秒单位。
+这种双语言方法是 Android 渐进式内存安全策略的一个示例。新的传输管理器用
+Rust 编写，并通过 `cxx` 垫片桥接到 C++ 协议栈。整个协议栈不会一次性重写。
+
+### 37.2.5 BTIF：JNI 桥梁
+
+蓝牙接口层（`btif/`）通过 JNI 桥接 Java `AdapterService` 和原生 C++ 协议
+栈。每个配置文件都有一个对应的 `btif_*.cc` 文件。
+
+源文件：`packages/modules/Bluetooth/system/btif/src/`
+
+关键 BTIF 文件：
+
+| 文件 | 用途 |
+|------|---------|
+| `btif_core.cc` | 核心初始化、开启/关闭 |
+| `btif_dm.cc` | 设备管理：发现、配对 |
+| `btif_av.cc` | A2DP 音频/视频 |
+| `btif_hf.cc` | 免提配置文件（音频网关） |
+| `btif_hh.cc` | HID 主机 |
+| `btif_hd.cc` | HID 设备 |
+| `btif_gatt.cc` | GATT 操作 |
+| `btif_gatt_client.cc` | GATT 客户端操作 |
+| `btif_gatt_server.cc` | GATT 服务器操作 |
+| `btif_ble_scanner.cc` | BLE 扫描 |
+| `btif_pan.cc` | 个人局域网 |
+| `btif_rc.cc` | AVRCP 远程控制 |
+| `btif_storage.cc` | 持久化存储（配对数据） |
+| `btif_sock.cc` | RFCOMM/L2CAP 套接字管理 |
+| `btif_le_audio.cc` | LE Audio |
+| `btif_config.cc` | 配置文件管理 |
+| `stack_manager.cc` | 协议栈初始化序列 |
+
+`btif_core.cc` 从 APEX 读取其配置：
+
+```cpp
+#if defined(__ANDROID__)
+#define BTE_DID_CONF_FILE "/apex/com.android.bt/etc/bluetooth/bt_did.conf"
+#endif
+```
+
+### 37.2.6 协议栈初始化序列
+
+当 `BluetoothManagerService` 请求开启时，会发生以下序列：
+
+```mermaid
+sequenceDiagram
+    participant App as Application
+    participant BMS as BluetoothManagerService
+    participant AS as AdapterService
+    participant SM as StackManager
+    participant BTIF as btif_core
+    participant GD as GD Modules
+    participant HAL as IBluetoothHci
+
+    App->>BMS: enable()
+    BMS->>AS: bind to AdapterService
+    AS->>SM: stack_init() / stack_enable()
+    SM->>BTIF: btif_init_bluetooth()
+    BTIF->>GD: Initialize GD modules
+    GD->>HAL: initialize(callback)
+    HAL-->>GD: initializationComplete(SUCCESS)
+    GD-->>BTIF: Stack ready
+    BTIF->>SM: Initialize L2CAP, SDP, SMP, GATT
+    SM->>SM: Initialize BTA subsystem
+    SM-->>AS: Stack started
+    AS->>AS: Start profile services
+    AS-->>BMS: STATE_ON
+    BMS-->>App: ACTION_STATE_CHANGED(STATE_ON)
+```
+
+`stack_manager.cc` 中的协议栈初始化遵循特定顺序：
+
+源文件：`packages/modules/Bluetooth/system/btif/src/stack_manager.cc`
+
+```cpp
+// Stack components are initialized in dependency order:
+// 1. OSI (OS Interface) module
+// 2. GD modules (HAL, HCI, Controller)
+// 3. BTM (Bluetooth Manager)
+// 4. L2CAP
+// 5. SDP
+// 6. SMP
+// 7. GATT
+// 8. GAP
+// 9. PAN/BNEP (if enabled)
+// 10. HID (if enabled)
+// 11. BTA system manager
+```
+
+### 37.2.7 垫片层
+
+垫片层（`main/shim/`）是一个关键的架构组件，它允许旧的 Fluoride 代码逐渐
+采用 GD 模块。与其进行一次性的大重写，每个 GD 模块都提供一个垫片。垫片呈现
+Fluoride 代码所期望的相同接口。在内部，它委托给新的实现。
+
+源文件：`packages/modules/Bluetooth/system/main/shim/`
+
+这种设计实现了增量迁移：
+
+1. 用现代设计编写一个新的 GD 模块
+2. 创建一个将 GD API 适配到旧接口的垫片
+3. 通过垫片重定旧的代码路径
+4. 当所有使用者都迁移后，最终移除垫片
+
+BTIF 层用于访问 GD 模块的入口点被集中管理：
+
+源文件：`packages/modules/Bluetooth/system/main/shim/entry.h`
+
+### 37.2.8 Floss：Linux 蓝牙协议栈
+
+AOSP 还包含 **Floss**（`packages/modules/Bluetooth/floss/`），这是一个面向
+Linux 的蓝牙协议栈，它重用相同的原生代码，但面向桌面 Linux 环境而非
+Android。Floss 取代了 ChromeOS 和其他 Google 平台的 BlueZ，共享相同的代码
+库，同时使用 D-Bus 而不是 Binder 进行 IPC。
+
+---
+
+## 37.3 蓝牙配置文件
+
+蓝牙配置文件定义了特定用例的过程和数据格式。AOSP 在三层中实现配置文件：
+Java 服务类（在蓝牙 APK 中）、C++ 中的 BTA（蓝牙应用）处理程序，以及协议
+栈中的协议级代码。
+
+### 37.3.1 配置文件架构
+
+每个配置文件都遵循一致的模式：
+
+```mermaid
+graph TB
+    subgraph "Java Layer"
+        PROXY["BluetoothXxx<br/>(Framework Proxy)"]
+        SERVICE["XxxService<br/>(Bluetooth APK)"]
+        NATIVE["XxxNativeInterface<br/>(JNI Bridge)"]
+    end
+
+    subgraph "Native Layer"
+        BTIF_X["btif_xxx.cc"]
+        BTA_X["bta/xxx/"]
+        STACK_X["stack/xxx/"]
+    end
+
+    PROXY -->|"AIDL Binder"| SERVICE
+    SERVICE --> NATIVE
+    NATIVE -->|"JNI"| BTIF_X
+    BTIF_X --> BTA_X
+    BTA_X --> STACK_X
+```
+
+蓝牙 APK 中的配置文件服务：
+
+源文件：`packages/modules/Bluetooth/android/app/src/com/android/bluetooth/`
+
+```
+a2dp/          -- A2dpService, A2dpStateMachine
+a2dpsink/      -- A2dpSinkService (receiver role)
+avrcp/         -- AvrcpTargetService
+avrcpcontroller/ -- AvrcpControllerService
+bas/           -- BatteryService
+bass_client/   -- BassClientService (broadcast audio)
+btservice/     -- AdapterService, ProfileService base
+csip/          -- CsipSetCoordinatorService
+gatt/          -- GattService
+hap/           -- HapClientService (Hearing Access)
+hearingaid/    -- HearingAidService
+hfp/           -- HeadsetService (HFP Audio Gateway)
+hfpclient/     -- HeadsetClientService
+hid/           -- HidHostService, HidDeviceService
+le_audio/      -- LeAudioService (Unicast Client), LeAudioPeripheralService (acceptor)
+le_scan/       -- Scanning
+map/           -- BluetoothMapService
+mapclient/     -- MapClientService
+mcp/           -- Media Control Profile
+opp/           -- OPP (Object Push)
+pan/           -- PanService
+pbap/          -- PBAP server
+pbapclient/    -- PbapClientService
+sap/           -- SIM Access Profile
+sdp/           -- SDP service
+tbs/           -- Telephone Bearer Service
+vc/            -- Volume Control
+```
+
+### 37.3.2 A2DP——高级音频分发配置文件
+
+A2DP 支持从源（通常是手机）向接收端（耳机、扬声器）进行高质量音频流传输。
+它使用 AVDTP（音频/视频分发传输协议）进行流管理。
+
+源文件：`packages/modules/Bluetooth/android/app/src/com/android/bluetooth/a2dp/A2dpService.java`
+
+```java
+public class A2dpService extends ConnectableProfile {
+    private final A2dpNativeInterface mNativeInterface;
+    private final A2dpCodecConfig mA2dpCodecConfig;
+    private final AudioManager mAudioManager;
+    private final int mMaxConnectedAudioDevices;
+
+    private BluetoothDevice mActiveDevice;
+    private final ConcurrentMap<BluetoothDevice, A2dpStateMachine> mStateMachines =
+            new ConcurrentHashMap<>();
+
+    private static final int MAX_A2DP_STATE_MACHINES = 50;
+    private final boolean mA2dpOffloadEnabled;
+}
+```
+
+A2DP 架构关键点：
+
+- **状态机**：每个已连接的设备都有自己的 `A2dpStateMachine` 实例（最多
+  `MAX_A2DP_STATE_MACHINES = 50` 个）。
+- **活动设备**：一次只有一个设备是活动的音频接收端（`mActiveDevice`），由
+  `mActiveSwitchingGuard` 保护。
+- **编解码器协商**：`A2dpCodecConfig` 管理编解码器的选择和配置（参见
+  37.7 节）。
+- **卸载支持**：`mA2dpOffloadEnabled` 指示 SoC 是否在硬件中处理编码。
+
+#### A2DP 状态机
+
+每个远程 A2DP 设备由一个 `A2dpStateMachine` 实例管理。源文件顶部的注释记录
+了完整的状态图：
+
+源文件：`packages/modules/Bluetooth/android/app/src/com/android/bluetooth/a2dp/A2dpStateMachine.java`
+
+```java
+// Bluetooth A2DP StateMachine. There is one instance per remote device.
+//  - "Disconnected" and "Connected" are steady states.
+//  - "Connecting" and "Disconnecting" are transient states until the
+//     connection / disconnection is completed.
+//
+//                        (Disconnected)
+//                           |       ^
+//                   CONNECT |       | DISCONNECTED
+//                           V       |
+//                 (Connecting)<--->(Disconnecting)
+//                           |       ^
+//                 CONNECTED |       | DISCONNECT
+//                           V       |
+//                          (Connected)
+// NOTES:
+//  - If state machine is in "Connecting" state and the remote device sends
+//    DISCONNECT request, the state machine transitions to "Disconnecting" state.
+//  - Similarly, if the state machine is in "Disconnecting" state and the remote
+//    device sends CONNECT request, the state machine transitions to "Connecting"
+//    state.
+```
+
+```java
+final class A2dpStateMachine extends StateMachine {
+    static final int MESSAGE_CONNECT = 1;
+    static final int MESSAGE_DISCONNECT = 2;
+    static final int MESSAGE_CONNECTION_STATE_CHANGED = 101;
+    private static final int MESSAGE_CONNECT_TIMEOUT = 201;
+
+    @VisibleForTesting static final Duration CONNECT_TIMEOUT = Duration.ofSeconds(30);
+
+    private final Disconnected mDisconnected;
+    private final Connecting mConnecting;
+    private final Disconnecting mDisconnecting;
+    private final Connected mConnected;
+    private final boolean mA2dpOffloadEnabled;
+}
+```
+
+```mermaid
+stateDiagram-v2
+    [*] --> Disconnected
+    Disconnected --> Connecting : CONNECT
+    Connecting --> Connected : CONNECTED
+    Connecting --> Disconnected : TIMEOUT/REJECT
+    Connecting --> Disconnecting : DISCONNECT from remote
+    Connected --> Disconnecting : DISCONNECT
+    Disconnecting --> Disconnected : DISCONNECTED
+    Disconnecting --> Connecting : CONNECT from remote
+```
+
+#### A2DP 协议栈
+
+A2DP 使用 AVDTP（音频/视频分发传输协议）进行信令和媒体传输，而 AVDTP 本身
+运行在 L2CAP 之上：
+
+```mermaid
+graph TB
+    subgraph "A2DP Protocol Stack"
+        A2DP_APP["A2DP Application"]
+        AVDTP_SIG["AVDTP Signaling"]
+        AVDTP_MEDIA["AVDTP Media Transport"]
+        L2CAP_SIG["L2CAP (Signaling Channel)"]
+        L2CAP_MEDIA["L2CAP (Media Channel)"]
+        ACL["ACL"]
+    end
+
+    A2DP_APP --> AVDTP_SIG
+    A2DP_APP --> AVDTP_MEDIA
+    AVDTP_SIG --> L2CAP_SIG
+    AVDTP_MEDIA --> L2CAP_MEDIA
+    L2CAP_SIG --> ACL
+    L2CAP_MEDIA --> ACL
+```
+
+原生 A2DP 和 AVDTP 实现：
+
+- 源文件：`packages/modules/Bluetooth/system/stack/a2dp/`（编解码器处理）
+- 源文件：`packages/modules/Bluetooth/system/stack/avdt/`（AVDTP 协议）
+- 源文件：`packages/modules/Bluetooth/system/bta/av/`（A2DP 应用层）
+
+### 37.3.3 HFP——免提配置文件
+
+HFP 支持通过蓝牙进行免提通话，通常用于车载套件和耳机。Android 实现音频
+网关（AG）角色。
+
+源文件：`packages/modules/Bluetooth/android/app/src/com/android/bluetooth/hfp/HeadsetService.java`
+
+`HeadsetStateMachine` 管理每台设备的连接状态。与 A2DP 不同，HFP 还有用于
+SCO 音频连接管理的额外状态：
+
+源文件：`packages/modules/Bluetooth/android/app/src/com/android/bluetooth/hfp/HeadsetStateMachine.java`
+
+```java
+class HeadsetStateMachine extends StateMachine {
+    static final int CONNECT = 1;
+    static final int DISCONNECT = 2;
+    static final int CONNECT_AUDIO = 3;
+    static final int DISCONNECT_AUDIO = 4;
+    static final int VOICE_RECOGNITION_START = 5;
+    static final int VOICE_RECOGNITION_STOP = 6;
+    static final int INTENT_SCO_VOLUME_CHANGED = 7;
+    static final int CALL_STATE_CHANGED = 9;
+    static final int DEVICE_STATE_CHANGED = 10;
+    static final int SEND_CLCC_RESPONSE = 11;
+
+    private static final int MAX_RETRY_DISCONNECT_AUDIO = 3;
+
+    // State machine states (7 states vs A2DP's 4)
+    private final Disconnected mDisconnected = new Disconnected();
+    private final Connecting mConnecting = new Connecting();
+    private final Disconnecting mDisconnecting = new Disconnecting();
+    private final Connected mConnected = new Connected();
+    private final AudioOn mAudioOn = new AudioOn();
+    private final AudioConnecting mAudioConnecting = new AudioConnecting();
+    private final AudioDisconnecting mAudioDisconnecting = new AudioDisconnecting();
+}
+```
+
+HFP 状态机有 7 个状态，反映了 HFP 连接的双重性质（服务级连接 + 音频连接）：
+
+```mermaid
+stateDiagram-v2
+    [*] --> Disconnected
+    Disconnected --> Connecting : CONNECT
+    Connecting --> Connected : CONNECTED
+    Connecting --> Disconnected : TIMEOUT
+    Connected --> Disconnecting : DISCONNECT
+    Connected --> AudioConnecting : CONNECT_AUDIO
+    AudioConnecting --> AudioOn : AUDIO_CONNECTED
+    AudioConnecting --> Connected : AUDIO_TIMEOUT
+    AudioOn --> AudioDisconnecting : DISCONNECT_AUDIO
+    AudioDisconnecting --> Connected : AUDIO_DISCONNECTED
+    Disconnecting --> Disconnected : DISCONNECTED
+```
+
+HFP 的关键特性：
+
+- **AT 命令处理**：电话状态、呼叫控制、DTMF、来电显示
+- **SCO 音频连接管理**：与服务级 ACL 连接分离
+- **宽带语音**：mSBC（16 kHz）和 LC3（32 kHz）编解码器支持
+- **电话状态同步**：呼叫状态、信号强度、电池电量、漫游状态
+- **带内铃声**：通过耳机播放铃声音频
+- **语音识别激活**：从耳机按钮触发语音助手
+- **CLCC 响应**：当前呼叫列表，通过 AT+CLCC 报告
+
+HFP 原生接口位于 `btif_hf.cc`，它实现 AG 角色回调。HFP 使用 RFCOMM 作为
+AT 命令通道，使用 SCO 作为音频通道。
+
+#### HFP 音频编解码器
+
+| 编解码器 | 采样率 | 带宽 | 质量 |
+|-------|------------|-----------|---------|
+| CVSD | 8 kHz | 64 kbps | 窄带（强制） |
+| mSBC | 16 kHz | 64 kbps | 宽带（HFP 1.6+） |
+| LC3 | 32 kHz | 可变 | 超宽带（HFP 1.9+） |
+
+### 37.3.4 AVRCP——音频/视频远程控制配置文件
+
+AVRCP 允许远程控制媒体播放。Android 同时实现 Target（TG）和 Controller
+（CT）角色。
+
+源文件：`packages/modules/Bluetooth/android/app/src/com/android/bluetooth/avrcp/AvrcpTargetService.java`
+
+```java
+public class AvrcpTargetService extends ProfileService {
+    // Integrates with Android's MediaSession framework
+    // to relay now-playing info, play status, and media
+    // player list to connected controllers (car head units)
+}
+```
+
+AVRCP Target 特性：
+
+- 正在播放的元数据（标题、艺术家、专辑、时长）
+- 播放状态（正在播放、已暂停、位置）
+- 播放器应用设置（重复、随机播放）
+- 媒体播放器浏览
+- 封面图片（BIP——基本成像配置文件）
+- 音量同步（绝对音量）
+
+控制器端（`AvrcpControllerService`）连接到远程目标，并将媒体信息回传给
+Android 媒体框架。
+
+### 37.3.5 配置文件标识符
+
+`BluetoothProfile` 接口为每个支持的配置文件定义了数字标识符：
+
+源文件：`packages/modules/Bluetooth/framework/java/android/bluetooth/BluetoothProfile.java`
+
+```java
+public interface BluetoothProfile {
+    int STATE_DISCONNECTED = 0;
+    int STATE_CONNECTING = 1;
+    int STATE_CONNECTED = 2;
+    int STATE_DISCONNECTING = 3;
+
+    int HEADSET = 1;                    // HFP
+    int A2DP = 2;                       // A2DP Source
+    @Deprecated int HEALTH = 3;         // HDP (removed)
+    @SystemApi int HID_HOST = 4;        // HID Host
+    @SystemApi int PAN = 5;             // PAN
+    // ... PBAP, GATT, GATT_SERVER, MAP, SAP, A2DP_SINK,
+    // AVRCP_CONTROLLER, AVRCP, HID_DEVICE, OPP, HEADSET_CLIENT,
+    // HEARING_AID, LE_AUDIO (22), LE_AUDIO_BROADCAST (26), VOLUME_CONTROL,
+    // CSIP_SET_COORDINATOR, LE_CALL_CONTROL, HAP_CLIENT, BATTERY, etc.
+    int LE_AUDIO_PERIPHERAL = 33;       // LE Audio acceptor (Android 17)
+}
+```
+
+所有配置文件状态转换都通过 `Intent` 广播，附带 extras `EXTRA_STATE`（新
+状态）和 `EXTRA_PREVIOUS_STATE`（旧状态），使应用程序能够监控配置文件连接
+变化。
+
+### 37.3.6 HID——人机接口设备
+
+HID 支持蓝牙键盘、鼠标、游戏控制器和其他输入设备。AOSP 实现两种角色：
+
+- **HID 主机**（`HidHostService`）：接收来自远程 HID 设备的输入
+- **HID 设备**（`HidDeviceService`）：使 Android 设备充当 HID 外设（例如
+  虚拟键盘）
+
+源文件：`packages/modules/Bluetooth/android/app/src/com/android/bluetooth/hid/HidHostService.java`
+
+HID 使用 L2CAP 协议，有两个通道：
+
+- **控制通道**（PSM 0x0011）：用于 HID 控制命令
+- **中断通道**（PSM 0x0013）：用于输入报告
+
+`stack/hid/` 中的原生实现处理 HID 描述符解析、报告模式管理以及底层 L2CAP
+连接。
+
+### 37.3.7 PAN——个人局域网
+
+PAN 支持通过蓝牙进行 IP 网络连接。Android 同时支持 PANU（个人局域网用户）
+和 NAP（网络接入点）角色。
+
+源文件：`packages/modules/Bluetooth/android/app/src/com/android/bluetooth/pan/PanService.java`
+
+```java
+public class PanService extends ConnectableProfile {
+    private static final int BLUETOOTH_MAX_PAN_CONNECTIONS = 5;
+
+    final ConcurrentHashMap<BluetoothDevice, BluetoothPanDevice> mPanDevices =
+            new ConcurrentHashMap<>();
+    private final PanNativeInterface mNativeInterface;
+    private final TetheringManager mTetheringManager;
+}
+```
+
+PAN 使用运行在 L2CAP 之上的 BNEP（蓝牙网络封装协议）来传输以太网帧。
+`BluetoothTetheringNetworkFactory` 与 Android 的连接框架集成，以提供蓝牙
+网络共享。
+
+PAN 架构关键点：
+
+- 最多 5 个同时的 PAN 连接（`BLUETOOTH_MAX_PAN_CONNECTIONS`）
+- 与 `TetheringManager` 集成，用于 Android 网络共享
+- `PanNativeInterface` 通过 JNI 桥接到 `btif_pan.cc`
+- BNEP 协议封装 L2CAP 上的以太网帧
+
+协议栈在编译时强制 PAN 支持：
+
+源文件：`packages/modules/Bluetooth/system/btif/src/stack_manager.cc`
+
+```cpp
+static_assert(BTA_PAN_INCLUDED,
+              "#define BTA_PAN_INCLUDED preprocessor compilation flag is unsupported"
+              "  Pan profile is always included in the bluetooth stack"
+              "*** Conditional Compilation Directive error");
+static_assert(PAN_SUPPORTS_ROLE_NAP,
+              "#define PAN_SUPPORTS_ROLE_NAP preprocessor compilation flag is unsupported"
+              "  Pan profile always supports network access point in the bluetooth stack"
+              "*** Conditional Compilation Directive error");
+static_assert(PAN_SUPPORTS_ROLE_PANU,
+              "#define PAN_SUPPORTS_ROLE_PANU preprocessor compilation flag is "
+              "unsupported"
+              "  Pan profile always supports user as a client in the bluetooth stack"
+              "*** Conditional Compilation Directive error");
+```
+
+#### PAN 协议栈
+
+```mermaid
+graph TB
+    subgraph "PAN Protocol Stack"
+        IP["IP / TCP / UDP"]
+        BNEP["BNEP<br/>(Bluetooth Network Encapsulation)"]
+        L2CAP_PAN["L2CAP"]
+        ACL_PAN["ACL"]
+    end
+
+    IP --> BNEP
+    BNEP --> L2CAP_PAN
+    L2CAP_PAN --> ACL_PAN
+```
+
+### 37.3.8 核心协议栈
+
+在深入其余配置文件之前，有必要先了解所有配置文件共享的核心协议层。
+
+#### L2CAP（逻辑链路控制与适配协议）
+
+L2CAP 是蓝牙的基础多路复用层。所有更高层的协议和配置文件都运行在由
+Protocol/Service Multiplexer（PSM）值标识的 L2CAP 通道上。
+
+源文件：`packages/modules/Bluetooth/system/stack/l2cap/`
+
+```
+l2c_main.cc          -- L2CAP initialization and main loop
+l2c_api.cc           -- L2CAP API (connect, disconnect, write)
+l2c_csm.cc           -- Channel State Machine
+l2c_link.cc          -- ACL link management
+l2c_ble.cc           -- BLE-specific L2CAP
+l2c_ble_conn_params.cc -- BLE connection parameter management
+l2c_fcr.cc           -- Flow Control and Retransmission modes
+l2c_int.h            -- Internal definitions
+```
+
+关键的 L2CAP PSM 分配：
+
+| PSM | 协议 |
+|-----|----------|
+| 0x0001 | SDP |
+| 0x0003 | RFCOMM |
+| 0x000F | BNEP |
+| 0x0011 | HID Control |
+| 0x0013 | HID Interrupt |
+| 0x0017 | AVCTP (AVRCP) |
+| 0x0019 | AVDTP (A2DP) |
+| 0x001B | AVCTP Browse |
+| 0x001F | ATT (GATT/BLE) |
+| 0x0027 | EATT（`BT_PSM_EATT`） |
+
+此处 LE 基于信用的面向连接通道（LE CoC）没有固定的 PSM；它们使用动态分配的
+LE PSM。
+
+#### RFCOMM
+
+RFCOMM 在 L2CAP 上模拟串口连接。它提供简单的面向流接口，供 HFP、SPP 和
+OPP 等配置文件使用。
+
+源文件：`packages/modules/Bluetooth/system/stack/rfcomm/`
+
+#### SDP（服务发现协议）
+
+SDP 使设备能够发现远程设备上可用的服务。每个配置文件都注册一条描述其能力
+的 SDP 记录。
+
+源文件：`packages/modules/Bluetooth/system/stack/sdp/`
+
+### 37.3.9 GATT——通用属性配置文件
+
+GATT 是 BLE 通信的基础。它定义了客户端/服务器模型，设备在其中公开包含
+characteristic（数据值）和 descriptor（元数据）的服务。
+
+源文件：`packages/modules/Bluetooth/android/app/src/com/android/bluetooth/gatt/GattService.java`
+
+```java
+public class GattService extends ProfileService {
+    // Manages GATT client connections
+    // Handles GATT server registrations
+    // Coordinates BLE advertising (AdvertiseManager)
+    // Provides distance measurement
+}
+```
+
+BLE 扫描不是 `GattService` 的一部分：它由 `le_scan` 包中的 `ScanController`
+（`android/app/src/com/android/bluetooth/le_scan/ScanController.java`）拥有，
+由 `AdapterService` 直接启动。GATT 将在 37.4 节（BLE）中详细讨论。
+
+### 37.3.10 MAP——消息访问配置文件
+
+MAP 允许访问远程设备上的消息（SMS、MMS、电子邮件）。车载主机常用它来显示
+手机消息。
+
+源文件：`packages/modules/Bluetooth/android/app/src/com/android/bluetooth/map/`
+
+MAP 使用 RFCOMM 或 L2CAP 之上的 OBEX（对象交换）进行消息传输，并使用消息
+通知服务（MNS）在新消息到达时推送更新。
+
+### 37.3.11 PBAP——电话簿访问配置文件
+
+PBAP 允许远程设备访问电话簿。车载主机使用它同步联系人，以便进行免提通话和
+来电显示。
+
+源文件：`packages/modules/Bluetooth/android/app/src/com/android/bluetooth/pbapclient/PbapClientService.java`
+
+PBAP 通过 OBEX 传输 vCard 格式的联系人数据，支持照片传输和搜索等功能。
+
+### 37.3.12 OPP——对象推送配置文件
+
+OPP 提供简单的文件传输功能（“蓝牙分享”）。它是最简单的基于 OBEX 的配置文件，
+支持文件的推送和拉取。
+
+源文件：`packages/modules/Bluetooth/android/app/src/com/android/bluetooth/opp/`
+
+### 37.3.13 LE Audio 配置文件
+
+LE Audio 是蓝牙 5.2 引入的配置文件族。过去，AOSP 只实现了 *单播客户端*
+（central/initiator）侧，即手机驱动耳机和助听器。Android 17 还增加了
+*Peripheral*（接受方）侧。在此角色中，手机本身充当对等主机的 LE Audio
+接收端和源。37.3.14 节将介绍该角色。
+
+源文件：`packages/modules/Bluetooth/android/app/src/com/android/bluetooth/le_audio/LeAudioService.java`
+
+LE Audio 包括：
+
+- **BAP**（基本音频配置文件）：通过 LE 进行核心音频流传输
+- **LC3** 编解码器：强制的高音质低复杂度编解码器
+- **CIS**（连接同步流）：点对点音频
+- **BIS**（广播同步流）：一对多音频
+- **CSIP**（协调集）：多设备设置的组管理（例如左/右耳机）
+- **VCP**（音量控制）：分布式音量管理
+- **MCP**（媒体控制）：LE Audio 设备的媒体控制
+- **TBS**（电话承载服务）：LE Audio 的呼叫控制
+- **HAP**（听力访问配置文件）：助听器支持
+- **BASS**（广播音频扫描服务）：广播音频发现
+
+```mermaid
+graph TB
+    subgraph "LE Audio Profile Stack"
+        BAP["BAP<br/>(Basic Audio Profile)"]
+        CIS["CIS<br/>(Connected Isochronous)"]
+        BIS["BIS<br/>(Broadcast Isochronous)"]
+        CSIP["CSIP<br/>(Coordinated Sets)"]
+        VCP["VCP<br/>(Volume Control)"]
+        MCP["MCP<br/>(Media Control)"]
+        TBS["TBS<br/>(Telephone Bearer)"]
+        HAP["HAP<br/>(Hearing Access)"]
+        BASS["BASS<br/>(Broadcast Audio Scan)"]
+        LC3["LC3 Codec"]
+    end
+
+    BAP --> CIS
+    BAP --> BIS
+    BAP --> LC3
+    CSIP --> BAP
+    VCP --> BAP
+    MCP --> BAP
+    TBS --> BAP
+    HAP --> BAP
+    BASS --> BIS
+```
+
+### 37.3.14 LE Audio 外设（BAP 接受方）角色
+
+直到 Android 16，AOSP 的 LE Audio 实现都是*单播客户端*。手机充当 BAP
+*Initiator* 和 *Audio Source/Sink Client*，驱动耳机和助听器。Android 17
+增加了互补的 *Peripheral* 角色，即手机是 BAP *Acceptor*（服务器）。对等主机
+（例如 PC、车载主机或智能显示屏）连接到手机。主机发现手机的 Published
+Audio Capabilities，并向其流传输音频或从其接收音频。手机成为 LE Audio 扬声
+器、麦克风，或两者兼有。
+
+外设协议栈是 `packages/modules/Bluetooth/system/bta/le_audio/server/` 下的
+一个独立、自包含的实现，带有自己的框架配置文件
+（`BluetoothProfile.LE_AUDIO_PERIPHERAL = 33`）。
+
+#### 原生服务器：LeAudioServer
+
+原生入口点是 `LeAudioServer` 接口，JNI 层调用其静态方法。实现
+`LeAudioServerImpl` 组合 GATT 级音频服务和 ASE 机制。
+
+源文件：`packages/modules/Bluetooth/system/bta/include/bta_le_audio_server_api.h`
+
+```cpp
+class LeAudioServer {
+public:
+  static void Initialize(le_audio::LeAudioServerCallbacks* callbacks,
+                         std::unique_ptr<LeAudioServerDependencies> dependencies);
+  static void Cleanup(void);
+  static LeAudioServer* Get(void);
+  static void DebugDump(int fd);
+  static void ConfirmStreamStartRequest(const RawAddress& peer_address, bool allowed);
+  static void StopStream(const RawAddress& peer_address, uint8_t stream_id);
+};
+```
+
+服务器由可注入工厂（`LeAudioServerDependencies`）组装而成，这使得组件可以
+单独测试：
+
+```cpp
+struct LeAudioServerDependencies {
+  std::function<std::shared_ptr<LeAudioServerConfigManager>()> config_manager_factory;
+  std::function<std::shared_ptr<Pacs>()> pacs_factory;
+  std::function<std::shared_ptr<Ascs>()> ascs_factory;
+  std::function<std::shared_ptr<AseManager>(std::shared_ptr<Ascs>)> ase_manager_factory;
+  std::function<audio::le_audio::IPeripheralAudioSessionFactory*()>
+          peripheral_audio_session_factory;
+  std::function<audio::le_audio::IPeripheralAudioProviderFactory*()>
+          peripheral_audio_provider_factory;
+};
+```
+
+`LeAudioServerImpl` 同时实现 `Pacs::Callbacks` 和 `AseManager::Callbacks`：
+
+源文件：`packages/modules/Bluetooth/system/bta/le_audio/server/server.cc`
+
+```cpp
+class LeAudioServerImpl : public LeAudioServer,
+                          public Pacs::Callbacks,
+                          public AseManager::Callbacks {
+  // Initialize() registers the PACS and ASCS GATT services, builds the
+  // ASE manager, starts the peripheral audio sessions, and begins
+  // advertising the LE Audio services via the GD advertising-manager shim.
+};
+```
+
+#### GATT 服务与 ASE 机制
+
+接受方角色由 BAP 服务器端 GATT 服务和一组按端点划分的状态机构建而成：
+
+| 组件 | 源文件 | 角色 |
+|-----------|--------|------|
+| PACS | `system/bta/le_audio/pacs/pacs.h` | Published Audio Capabilities Service：向客户端公开接收端/源编解码器能力、音频位置以及支持/可用的音频上下文 |
+| ASCS | `system/bta/le_audio/ascs/ascs.h` | Audio Stream Control Service：接收客户端的 ASE Control Point 写入（Config Codec、Config QoS、Enable、Release、Update Metadata） |
+| ASE Manager | `system/bta/le_audio/ascs/ase_manager.h` | 为每个 Audio Stream Endpoint 拥有一个 ASE 状态机，并驱动编解码器/QoS 协商 |
+| ASE 状态机 | `system/bta/le_audio/ascs/ase_state_machine.h` | 按 ASE 划分的 BAP 状态机（IDLE、CODEC_CONFIGURED、QOS_CONFIGURED、ENABLING、STREAMING、DISABLING、RELEASING） |
+| 配置管理器 | `system/bta/le_audio/server/le_audio_server_config_manager.h` | 将 Audio HAL 能力转换为 PAC 记录，并决定 ISO 数据路径（软件还是卸载） |
+| 外设 Audio HAL 客户端 | `system/bta/le_audio/audio_hal_client/peripheral_audio_hal_client.h` | `PeripheralAudioHalDecoder`（ISO 到扬声器）和 `PeripheralAudioHalEncoder`（麦克风到 ISO） |
+
+按 ASE 划分的状态机遵循 BAP/ASCS Audio Stream Endpoint 生命周期：
+
+```mermaid
+stateDiagram-v2
+    [*] --> Idle
+    Idle --> CodecConfigured : CONFIG_CODEC
+    CodecConfigured --> QosConfigured : CONFIG_QOS
+    QosConfigured --> Enabling : ENABLE
+    Enabling --> Streaming : RECEIVER_START_READY
+    Streaming --> Disabling : DISABLE
+    Disabling --> QosConfigured : RECEIVER_STOP_READY
+    QosConfigured --> Releasing : RELEASE
+    Streaming --> Releasing : RELEASE
+    Releasing --> Idle : released
+    CodecConfigured --> Idle : RELEASE
+```
+
+#### 框架配置文件
+
+在 Java/Kotlin 侧，该角色作为配置文件服务公开。与重量级的单播
+`LeAudioService` 不同，外设服务是一个轻量的编排器，将策略委托给专用的管理器。
+
+| 类 | 源文件 | 角色 |
+|-------|--------|------|
+| `BluetoothLeAudioPeripheral` | `framework/java/android/bluetooth/BluetoothLeAudioPeripheral.java` | `@SystemApi` 配置文件代理（由 `Flags.FLAG_LEAUDIO_PERIPHERAL_FEATURE` 保护） |
+| `LeAudioPeripheralService` | `android/app/src/com/android/bluetooth/le_audio/LeAudioPeripheralService.kt` | 用于 `LE_AUDIO_PERIPHERAL` 的 `ProfileService`；拥有策略管理器和原生接口 |
+| `PeripheralPolicyManager` | `android/app/src/com/android/bluetooth/le_audio/PeripheralPolicyManager.kt` | 裁决流请求，跟踪活动的接收端/源设备和按对等方划分的流状态 |
+| `LeAudioPeripheralNativeInterface` | `android/app/src/com/android/bluetooth/le_audio/LeAudioPeripheralNativeInterface.kt` | 到原生 `LeAudioServer` 的 JNI 桥梁 |
+| `LeAudioPeripheralServiceBinder` | `android/app/src/com/android/bluetooth/le_audio/LeAudioPeripheralServiceBinder.kt` | 权限检查的 binder（`BLUETOOTH_CONNECT`、`BLUETOOTH_PRIVILEGED`） |
+
+`AdapterService` 通过标准的活动设备管道报告外设设备：Android 17 扩展了
+`getActiveDevices()` 以处理 `LE_AUDIO_PERIPHERAL` 配置文件。
+
+#### 流启动请求流程
+
+流由*远程*主机（客户端）发起，而不是手机，因此接受方的工作是允许或拒绝该
+请求。决策从原生 ASCS 向上传递到策略管理器，再返回：
+
+```mermaid
+sequenceDiagram
+    participant Peer as Remote Host (Client)
+    participant Ascs as ASCS / ASE Manager
+    participant Server as LeAudioServerImpl
+    participant Policy as PeripheralPolicyManager
+    participant Native as LeAudioServer (native)
+
+    Peer->>Ascs: ASE Control Point: Enable
+    Ascs->>Server: OnAseEnableRequest()
+    Server->>Policy: OnStreamStartRequest(address, requests)
+    Policy->>Policy: Arbitrate vs. active device
+    Policy->>Native: confirmStreamStartRequest(device, allowed)
+    Native->>Ascs: ConfirmAseEnableRequest()
+    Ascs->>Ascs: ASE: Enabling to Streaming
+    Ascs-->>Server: OnStreamStarted()
+    Server-->>Policy: OnStreamStarted (JNI callback)
+```
+
+这些流的同步传输通过原生 ISO 管理器运行。在使用 Rust 路径的地方，它通过
+37.2.4 节所述的 Rust ISO/周期同步管理器运行。外设的呼叫控制和媒体控制由
+`system/bta/ccp/` 和 `system/bta/mcp/` 下的专用 CCP 和 MCP 客户端处理。
+
+---
+
+## 37.4 BLE（低功耗蓝牙）
+
+### 37.4.1 AOSP 中的 BLE 架构
+
+低功耗蓝牙在自己的一组信道上运行（广播使用 37、38、39；数据使用 0-36）。
+它与经典蓝牙具有根本不同的连接模型。在 AOSP 中，BLE 功能涵盖三个主要领域：
+广播、扫描和 GATT 客户端/服务器操作。
+
+```mermaid
+graph TB
+    subgraph "Application"
+        APP_ADV["Advertiser App"]
+        APP_SCAN["Scanner App"]
+        APP_GATT_C["GATT Client App"]
+        APP_GATT_S["GATT Server App"]
+    end
+
+    subgraph "Framework"
+        BLE_ADV["BluetoothLeAdvertiser"]
+        BLE_SCAN["BluetoothLeScanner"]
+        GATT_C["BluetoothGatt"]
+        GATT_S["BluetoothGattServer"]
+    end
+
+    subgraph "Bluetooth Service"
+        GATT_SVC["GattService"]
+        ADV_MGR["AdvertiseManager"]
+        SCAN_CTRL["ScanController<br/>(le_scan)"]
+    end
+
+    subgraph "Native Stack"
+        BTIF_GATT["btif_gatt*.cc<br/>btif_ble_scanner.cc"]
+        GD_ADV["LeAdvertisingManagerImpl"]
+        GD_SCAN["LeScanningManagerImpl"]
+        GD_ACL["AclManagerLeImpl"]
+        STACK_GATT["stack/gatt/"]
+        RUST_GATT["rust/private_gatt/<br/>(Rust GATT server)"]
+    end
+
+    APP_ADV --> BLE_ADV --> GATT_SVC
+    APP_SCAN --> BLE_SCAN --> SCAN_CTRL
+    APP_GATT_C --> GATT_C --> GATT_SVC
+    APP_GATT_S --> GATT_S --> GATT_SVC
+    GATT_SVC --> ADV_MGR
+    GATT_SVC --> BTIF_GATT
+    ADV_MGR --> BTIF_GATT
+    SCAN_CTRL --> BTIF_GATT
+    BTIF_GATT --> GD_ADV
+    BTIF_GATT --> GD_SCAN
+    BTIF_GATT --> STACK_GATT
+    STACK_GATT --> RUST_GATT
+    GD_ADV --> GD_ACL
+    GD_SCAN --> GD_ACL
+```
+
+### 37.4.2 BLE 广播
+
+BLE 广播使设备可被附近的扫描器发现。AOSP 同时支持传统广播（31 字节 PDU）
+和扩展广播。扩展广播使用最多 251 字节的片段（`kLeMaximumFragmentLength`）。
+这些片段计入跨多个广播集的最大 255 字节 GAP 数据长度
+（`kLeMaximumGapDataLength`）。
+
+源文件：`packages/modules/Bluetooth/system/gd/hci/le_advertising_manager_impl.h`
+
+```cpp
+class LeAdvertisingManagerImpl : public LeAdvertisingManager {
+public:
+  static constexpr AdvertiserId kInvalidId = 0xFF;
+  static constexpr uint16_t kLeMaximumLegacyAdvertisingDataLength = 31;
+  static constexpr uint16_t kLeMaximumFragmentLength = 251;
+  static constexpr uint16_t kLeMaximumGapDataLength = 255;
+
+  void ExtendedCreateAdvertiser(
+      uint8_t client_id, int reg_id, const AdvertisingConfig config,
+      common::Callback<void(Address, AddressType)> scan_callback,
+      common::Callback<void(ErrorCode, uint8_t, uint8_t)> set_terminated_callback,
+      uint16_t duration, uint8_t max_extended_advertising_events,
+      os::Handler* handler) override;
+
+  void RegisterAdvertiser(
+      common::ContextualOnceCallback<void(uint8_t, AdvertisingStatus)>
+          callback) override;
+  // ...
+};
+```
+
+广播生命周期：
+
+```mermaid
+sequenceDiagram
+    participant App
+    participant Framework as BluetoothLeAdvertiser
+    participant GattSvc as GattService
+    participant AdvMgr as LeAdvertisingManagerImpl
+    participant HCI as HCI Layer
+
+    App->>Framework: startAdvertising(settings, data, callback)
+    Framework->>GattSvc: startAdvertisingSet(params, data, ...)
+    GattSvc->>AdvMgr: RegisterAdvertiser()
+    AdvMgr-->>GattSvc: advertiser_id
+    GattSvc->>AdvMgr: ExtendedCreateAdvertiser(config)
+    AdvMgr->>HCI: LE Set Advertising Parameters
+    AdvMgr->>HCI: LE Set Advertising Data
+    AdvMgr->>HCI: LE Set Scan Response Data
+    AdvMgr->>HCI: LE Set Advertising Enable
+    HCI-->>AdvMgr: Command Complete
+    AdvMgr-->>GattSvc: Advertising started
+    GattSvc-->>App: onStartSuccess(settingsInEffect)
+```
+
+广播参数包括：
+
+| 参数 | 说明 |
+|-----------|-------------|
+| 广播间隔 | 广播之间的最小/最大时间（20 毫秒 - 10.24 秒） |
+| 广播类型 | 可连接、可扫描、不可连接、定向 |
+| 发射功率等级 | 发射功率（-127 至 +20 dBm） |
+| 主 PHY | 1M、Coded（用于扩展范围） |
+| 次 PHY | 1M、2M、Coded |
+| 广播 SID | 扩展广播的集合标识符 |
+| 自身地址类型 | 公有、随机、RPA |
+
+### 37.4.3 BLE 扫描
+
+BLE 扫描用于发现附近广播的设备。AOSP 提供复杂的过滤功能以降低功耗。
+
+源文件：`packages/modules/Bluetooth/system/gd/hci/le_scanning_manager_impl.h`
+
+```cpp
+class LeScanningManagerImpl : public LeScanningManager {
+public:
+  static constexpr uint8_t kMaxAppNum = 32;
+
+  void RegisterScanner(const Uuid app_uuid) override;
+  void Scan(bool start) override;
+  void SetScanParameters(LeScanType scan_type, ...) override;
+  void SetScanFilterPolicy(LeScanningFilterPolicy filter_policy) override;
+
+  // Hardware-accelerated scan filtering
+  void ScanFilterEnable(bool enable) override;
+  void ScanFilterParameterSetup(ApcfAction action, uint8_t filter_index,
+      AdvertisingFilterParameter advertising_filter_parameter) override;
+  void ScanFilterAdd(uint8_t filter_index,
+      std::vector<AdvertisingPacketContentFilterCommand> filters) override;
+
+  // Batch scanning for power efficiency
+  void BatchScanConfigStorage(uint8_t batch_scan_full_max,
+      uint8_t batch_scan_truncated_max,
+      uint8_t batch_scan_notify_threshold, ScannerId scanner_id) override;
+  void BatchScanEnable(BatchScanMode scan_mode, ...) override;
+};
+```
+
+AOSP 的扫描模式在延迟与功耗之间进行权衡：
+
+| 扫描模式 | 行为 |
+|-----------|----------|
+| `SCAN_MODE_LOW_POWER` | 每约 5120 毫秒扫描约 512 毫秒 |
+| `SCAN_MODE_BALANCED` | 每约 4096 毫秒扫描约 1024 毫秒 |
+| `SCAN_MODE_LOW_LATENCY` | 连续扫描 |
+| `SCAN_MODE_OPPORTUNISTIC` | 自身不扫描；搭其他扫描的便车 |
+
+扫描过滤器类型（APCF——Android 平台内容过滤）：
+
+```mermaid
+graph TB
+    SF["Scan Filters"]
+    SF --> NAME["Device Name"]
+    SF --> ADDR["Device Address"]
+    SF --> UUID["Service UUID"]
+    SF --> SOLICIT["Solicitation UUID"]
+    SF --> SD["Service Data"]
+    SF --> MD["Manufacturer Data"]
+    SF --> TRANSPORT["Transport Block"]
+```
+
+硬件扫描过滤（APCF）将过滤器匹配卸载到蓝牙控制器，使主机处理器可以在控制器
+监视匹配的广播时休眠。
+
+### 37.4.4 GATT 客户端
+
+GATT 客户端发现并交互远程 BLE 设备上的服务。
+
+关键操作：
+
+1. **服务发现**：`discoverServices()` 枚举远程设备上的所有服务、
+   characteristic 和 descriptor
+2. **读取/写入**：读取或写入 characteristic 和 descriptor 值
+3. **通知/指示**：订阅值变化通知
+4. **MTU 协商**：请求更大的 ATT MTU 以提高效率
+
+原生代码中的 GATT 协议栈：
+
+源文件：`packages/modules/Bluetooth/system/stack/gatt/`
+
+```
+gatt_main.cc   -- GATT module initialization
+gatt_api.cc    -- Public API (GATTS_*, GATTC_* functions)
+gatt_cl.cc     -- GATT client procedures
+gatt_sr.cc     -- GATT server procedures
+gatt_db.cc     -- Service database management
+gatt_auth.cc   -- Authentication handling
+gatt_utils.cc  -- Utility functions
+gatt_attr.cc   -- Attribute handling
+att_protocol.cc -- ATT protocol PDU handling
+```
+
+```mermaid
+sequenceDiagram
+    participant App
+    participant BG as BluetoothGatt
+    participant GS as GattService
+    participant Stack as stack/gatt
+
+    App->>BG: connectGatt(device, autoConnect, callback)
+    BG->>GS: clientConnect(address, ...)
+    GS->>Stack: GATTC_Open()
+    Stack-->>GS: onConnected(conn_id)
+    GS-->>App: onConnectionStateChange(CONNECTED)
+
+    App->>BG: discoverServices()
+    BG->>GS: discoverServices(conn_id)
+    GS->>Stack: GATTC_Discover(conn_id)
+    Stack-->>GS: onSearchComplete(services)
+    GS-->>App: onServicesDiscovered(status)
+
+    App->>BG: readCharacteristic(char)
+    BG->>GS: readCharacteristic(conn_id, handle)
+    GS->>Stack: GATTC_Read(conn_id, handle)
+    Stack-->>GS: onReadComplete(value)
+    GS-->>App: onCharacteristicRead(char, value)
+```
+
+### 37.4.5 GATT 服务器
+
+GATT 服务器托管远程设备可以发现并与之交互的本地服务。应用程序使用
+`BluetoothManager.openGattServer()` 创建服务器实例。
+
+源文件：`packages/modules/Bluetooth/framework/java/android/bluetooth/BluetoothManager.java`
+
+```java
+public BluetoothGattServer openGattServer(
+        Context context, BluetoothGattServerCallback callback,
+        int transport, boolean eattSupport) {
+    IBluetoothGatt iGatt = mAdapter.getBluetoothGatt();
+    if (iGatt == null) return null;
+    BluetoothGattServer mGattServer = new BluetoothGattServer(iGatt, transport, mAdapter);
+    Boolean regStatus = mGattServer.registerCallback(callback, eattSupport);
+    return regStatus ? mGattServer : null;
+}
+```
+
+GATT 服务器操作：
+
+- 添加包含 characteristic 和 descriptor 的服务
+- 处理来自远程客户端的读取/写入请求
+- 向已订阅的客户端发送通知/指示
+- 管理多个同时进行的客户端连接
+
+Rust GATT 服务器（`system/rust/private_gatt/src/gatt.rs`）使用仲裁器与 C++
+实现共享 ATT 承载，使两者可以在同一连接上共存。Android 17 将此服务器移入
+自己的 `private_gatt` crate，并移除了其静态全局状态。
+
+### 37.4.6 BLE 连接管理
+
+BLE 连接使用 GD 协议栈中的 LE ACL 管理器：
+
+源文件：`packages/modules/Bluetooth/system/gd/hci/acl_manager/`
+
+```
+acl_manager_le.h              -- LE ACL manager interface
+acl_manager_le_impl.cc        -- LE ACL connection implementation
+acl_connection.cc              -- ACL connection base class
+acl_scheduler.cc               -- Connection scheduling
+```
+
+由协议栈管理的连接参数：
+
+- **连接间隔**：设备通信的频率（7.5 毫秒 - 4 秒）
+- **外设延迟**：外设可以跳过的连接事件数
+- **监督超时**：宣布连接丢失之前的时间
+- **连接 PHY**：1M、2M（更快）或 Coded（更远距离）
+
+### 37.4.7 LE 地址隐私
+
+BLE 使用可解析私有地址（RPA）来防止跟踪。GD 中的 `LeAddressManager` 处理
+RPA 轮换：
+
+源文件：`packages/modules/Bluetooth/system/gd/hci/le_address_manager.h`
+
+RPA 由身份解析密钥（IRK）和一个随机数生成，然后定期轮换（通常每 15 分钟一
+次）。只有拥有 IRK 的设备才能将 RPA 解析回设备的身份。
+
+```mermaid
+graph TB
+    subgraph "RPA Generation"
+        IRK["Identity Resolving Key<br/>(128-bit, shared during bonding)"]
+        RAND["Random Number<br/>(24-bit prand)"]
+        HASH["hash = AES-128(IRK, prand)"]
+        RPA["RPA = prand || hash[0:23]"]
+    end
+
+    IRK --> HASH
+    RAND --> HASH
+    HASH --> RPA
+
+    subgraph "RPA Resolution"
+        RPA2["Received RPA"]
+        EXTRACT["Extract prand from RPA"]
+        HASH2["computed_hash = AES-128(IRK, prand)"]
+        COMPARE["Compare hash portions"]
+        RESULT["Identity Confirmed"]
+    end
+
+    RPA2 --> EXTRACT
+    EXTRACT --> HASH2
+    HASH2 --> COMPARE
+    COMPARE --> RESULT
+```
+
+BLE 中的地址类型：
+
+| 类型 | 说明 |
+|------|-------------|
+| Public | 固定的 IEEE 802 地址（类似经典蓝牙） |
+| Random Static | 随机地址，在一次电源循环内固定 |
+| Random Private Resolvable | 定期轮换，可用 IRK 解析 |
+| Random Private Non-Resolvable | 定期轮换，不可解析 |
+
+`stack/btm/btm_ble_int.h` 中的原生代码提供底层 BLE 管理函数：
+
+源文件：`packages/modules/Bluetooth/system/stack/btm/btm_ble_int.h`
+
+```cpp
+void btm_ble_init(void);
+void btm_ble_free();
+void btm_ble_connected(const RawAddress& bda, uint16_t handle,
+                       uint8_t enc_mode, uint8_t role,
+                       tBLE_ADDR_TYPE addr_type,
+                       bool can_read_discoverable_characteristics);
+BtmDevice* btm_ble_resolve_random_addr(const RawAddress& random_bda);
+void btm_ble_batchscan_init(void);
+void btm_ble_adv_filter_init(void);
+```
+
+### 37.4.8 BLE 框架 API 类
+
+BLE 框架 API 组织在 `android.bluetooth.le` 包中：
+
+源文件：`packages/modules/Bluetooth/framework/java/android/bluetooth/le/`
+
+| 类 | 用途 |
+|-------|---------|
+| `BluetoothLeScanner` | 启动/停止 BLE 扫描 |
+| `BluetoothLeAdvertiser` | 启动/停止 BLE 广播 |
+| `ScanSettings` | 配置扫描参数（模式、回调类型） |
+| `ScanFilter` | 过滤扫描结果（名称、UUID、地址等） |
+| `ScanResult` | 表示一个被发现的 BLE 设备 |
+| `ScanRecord` | 解析后的广播数据 |
+| `ScanCallback` | 扫描事件的回调 |
+| `AdvertiseSettings` | 配置传统广播参数 |
+| `AdvertisingSetParameters` | 配置扩展广播参数 |
+| `AdvertiseData` | 广播负载数据 |
+| `AdvertiseCallback` | 广播事件的回调 |
+| `PeriodicAdvertisingParameters` | 配置周期广播 |
+| `PeriodicAdvertisingCallback` | 周期广播同步的回调 |
+| `PeriodicAdvertisingReport` | 从周期广播同步接收的数据 |
+| `DistanceMeasurementManager` | 信道探测/测距 |
+| `ChannelSoundingParams` | 距离测量的参数 |
+
+### 37.4.9 EATT（增强型 ATT）
+
+蓝牙 5.2 引入了增强型 ATT，允许在单个 LE 连接上有多个 ATT 承载。这使 GATT
+操作可以并行进行，而不会出现队头阻塞。
+
+源文件：`packages/modules/Bluetooth/system/stack/eatt/`
+
+EATT 使用 L2CAP 基于信用的流控（CoC）通道，每个通道充当独立的 ATT 承载。
+`BluetoothManager.openGattServer()` 中的 `eattSupport` 参数控制服务器是否将
+EATT 用于通知。
+
+### 37.4.10 信道探测与距离测量
+
+蓝牙 6.0 引入了*信道探测*（CS），这是一种测量两个 LE 设备之间距离的测距技
+术。它使用跨许多无线电信道的基于相位和往返时间的测量。AOSP 通过*距离测量*
+API 将其公开，当控制器不支持 CS 时，该 API 可以回退到基于 RSSI 的估计。
+Android 17 大幅完善了此功能：收紧了安全模型，在结果中增加了功率/RSSI 报告，
+并将服务端的粘合代码迁移到了 Kotlin。
+
+主机能力由控制器功能位进行门控：
+
+源文件：`packages/modules/Bluetooth/system/gd/hci/controller.h`
+
+```cpp
+virtual bool SupportsBleChannelSounding() const = 0;
+```
+
+#### 原生距离测量管理器
+
+原生引擎是 GD HCI 层中的 `DistanceMeasurementManager`。它支持三种方法，并
+驱动 CS HCI 命令序列。
+
+源文件：`packages/modules/Bluetooth/system/gd/hci/distance_measurement_manager.h`
+
+```cpp
+enum DistanceMeasurementMethod {
+  METHOD_AUTO,   // pick the best available method
+  METHOD_RSSI,   // RSSI + TX power estimation
+  METHOD_CS,     // Channel Sounding
+};
+
+void StartDistanceMeasurement(int32_t app_uid, const Address& address,
+                              uint16_t connection_handle, hci::Role local_hci_role,
+                              uint16_t interval, DistanceMeasurementMethod method,
+                              DistanceMeasurementSightType sight_type,
+                              DistanceMeasurementLocationType location_type);
+void StopDistanceMeasurement(const Address& address, uint16_t connection_handle,
+                             DistanceMeasurementMethod method);
+```
+
+对于 CS 会话，实现（`distance_measurement_manager_impl.cc`）遍历一个按连接
+划分的状态机，按顺序发出 LE 信道探测 HCI 命令：
+
+```mermaid
+sequenceDiagram
+    participant App
+    participant DMM as DistanceMeasurementManager
+    participant HCI as HCI / Controller
+
+    App->>DMM: StartDistanceMeasurement(METHOD_CS)
+    DMM->>HCI: LE CS Read Remote Supported Capabilities
+    DMM->>HCI: LE CS Set Default Settings
+    DMM->>HCI: LE CS Create Config
+    Note over DMM,HCI: WAIT_FOR_SECURITY_ENABLED
+    DMM->>HCI: LE CS Security Enable
+    HCI-->>DMM: LE CS Security Enable Complete
+    DMM->>HCI: LE CS Set Procedure Parameters
+    DMM->>HCI: LE CS Procedure Enable
+    HCI-->>DMM: CS subevent results
+    DMM-->>App: OnDistanceMeasurementResult(...)
+```
+
+结果远不止一个原始距离。回调报告以下值：
+
+- 以厘米为单位的距离和误差
+- 方位角/高度角
+- 延迟扩展
+- 置信度水平
+- 归一化攻击检测器指标（NADM）攻击等级
+- 相对速度
+- 远程发射功率和反射器 RSSI（Android 17 新增）
+
+#### 测距的安全强制执行
+
+信道探测可能泄露邻近信息。因此，Android 17 添加了
+`enforce_security_for_ranging` 标志，要求会话启动之前必须建立*加密的 LE 安全
+连接*链路。该标志与测距 aconfig 中的功率/RSSI 结果标志一起定义：
+
+源文件：`packages/modules/Bluetooth/flags/ranging.aconfig`
+
+当标志设置时，服务端管理器的 `checkLinkRequirements()` 会在两种情况下拒绝
+会话。除非设备已使用安全连接配对算法配对，否则它会拒绝会话。除非 LE 链路目
+前使用 AES 和 16 字节密钥加密，否则它也会拒绝会话：
+
+源文件：`packages/modules/Bluetooth/android/app/src/com/android/bluetooth/gatt/DistanceMeasurementManager.java`
+
+在原生协议栈中，相同的保证在空中强制执行。状态机发送
+`LE CS Security Enable` 并等待其完成。只有这样它才会发出
+`LE CS Procedure Enable`，因此测距绝不会在未加密的链路上运行。
+
+#### 框架和服务表面
+
+公共 API 位于 `android.bluetooth.le` 中：
+
+| 类 | 源文件 | 用途 |
+|-------|--------|---------|
+| `DistanceMeasurementManager` | `framework/java/android/bluetooth/le/DistanceMeasurementManager.java` | 启动会话，查询支持的方法 |
+| `DistanceMeasurementParams` | `.../le/DistanceMeasurementParams.java` | 设备、持续时间、频率、方法 ID、CS 参数 |
+| `ChannelSoundingParams` | `.../le/ChannelSoundingParams.java` | Sight type、location type、CS 安全级别（1-4） |
+| `DistanceMeasurementResult` | `.../le/DistanceMeasurementResult.java` | 距离、角度、NADM、速度、发射功率、RSSI |
+| `DistanceMeasurementSession` | `.../le/DistanceMeasurementSession.java` | 带有 `Callback`（onStarted/onResult/onStopped）的会话句柄 |
+| `DistanceMeasurementMethod` | `.../le/DistanceMeasurementMethod.java` | 描述一种方法（AUTO/RSSI/CHANNEL_SOUNDING） |
+
+服务端位于 `GattService` 内。Android 17 将其原生粘合代码转换为 Kotlin：
+`DistanceMeasurementNativeInterface.kt`（JNI 调用）、
+`DistanceMeasurementNativeCallback.kt`（原生到框架的回调）和
+`DistanceMeasurementBinder.kt`（IPC 入口点），全部位于
+`packages/modules/Bluetooth/android/app/src/com/android/bluetooth/gatt/` 之下。
+
+---
+
+## 37.5 蓝牙 HAL
+
+### 37.5.1 HAL 接口设计
+
+蓝牙 HAL 在供应商特定的控制器固件与通用的 AOSP 蓝牙协议栈之间提供了清晰
+的边界。该接口在 HCI（主机控制器接口）层运行，只处理 HCI 分组。
+
+源文件：`hardware/interfaces/bluetooth/aidl/android/hardware/bluetooth/IBluetoothHci.aidl`
+
+```java
+@VintfStability
+interface IBluetoothHci {
+    void close();
+    void initialize(in IBluetoothHciCallbacks callback);
+    void sendAclData(in byte[] data);
+    void sendHciCommand(in byte[] command);
+    void sendIsoData(in byte[] data);
+    void sendScoData(in byte[] data);
+}
+```
+
+该接口经过刻意简化——仅六个方法，覆盖完整的 HCI 传输：
+
+| 方法 | HCI 分组类型 | 方向 |
+|--------|----------------|-----------|
+| `sendHciCommand()` | 命令（0x01） | 主机 -> 控制器 |
+| `sendAclData()` | ACL 数据（0x02） | 主机 -> 控制器 |
+| `sendScoData()` | SCO 数据（0x03） | 主机 -> 控制器 |
+| `sendIsoData()` | ISO 数据（0x05） | 主机 -> 控制器 |
+| `initialize()` | 建立 | 主机 -> 控制器 |
+| `close()` | 拆除 | 主机 -> 控制器 |
+
+### 37.5.2 HAL 回调
+
+回调接口处理从控制器到主机的分组：
+
+源文件：`hardware/interfaces/bluetooth/aidl/android/hardware/bluetooth/IBluetoothHciCallbacks.aidl`
+
+```java
+@VintfStability
+interface IBluetoothHciCallbacks {
+    void aclDataReceived(in byte[] data);
+    void hciEventReceived(in byte[] event);
+    void initializationComplete(in Status status);
+    void isoDataReceived(in byte[] data);
+    void scoDataReceived(in byte[] data);
+}
+```
+
+### 37.5.3 HAL 状态码
+
+源文件：`hardware/interfaces/bluetooth/aidl/android/hardware/bluetooth/Status.aidl`
+
+```java
+@VintfStability
+@Backing(type="int")
+enum Status {
+    SUCCESS,
+    ALREADY_INITIALIZED,
+    UNABLE_TO_OPEN_INTERFACE,
+    HARDWARE_INITIALIZATION_ERROR,
+    UNKNOWN,
+}
+```
+
+### 37.5.4 AIDL 后端实现
+
+GD 协议栈通过 AIDL 后端连接到 HAL：
+
+源文件：`packages/modules/Bluetooth/system/gd/hal/hci_backend_aidl.cc`
+
+```cpp
+class AidlHci : public HciBackend {
+public:
+  AidlHci(const char* service_name) {
+    ::ndk::SpAIBinder binder(AServiceManager_waitForService(service_name));
+    hci_ = aidl::android::hardware::bluetooth::IBluetoothHci::fromBinder(binder);
+
+    // Set up death recipient to detect HAL crashes
+    death_recipient_ = ::ndk::ScopedAIBinder_DeathRecipient(
+        AIBinder_DeathRecipient_new([](void*) {
+          log::error("The Bluetooth HAL service died.");
+          log::fatal("The Bluetooth HAL died.");
+        }));
+    AIBinder_linkToDeath(hci_->asBinder().get(), death_recipient_.get(), this);
+  }
+  // ...
+};
+```
+
+用于连接到 HAL 的 AIDL 服务名：
+
+```cpp
+static constexpr char kBluetoothAidlHalInterfaceName[] =
+    "android.hardware.bluetooth.IBluetoothHci";
+```
+
+`AidlHciCallbacks` 类将 HAL 回调桥接到 GD 协议栈：
+
+```cpp
+class AidlHciCallbacks : public BnBluetoothHciCallbacks {
+public:
+  AidlHciCallbacks(std::shared_ptr<HciBackendCallbacks> callbacks)
+      : callbacks_(callbacks) {}
+
+  ::ndk::ScopedAStatus initializationComplete(AidlStatus status) override {
+    log::assert_that(status == AidlStatus::SUCCESS, "...");
+    callbacks_->initializationComplete();
+    return ::ndk::ScopedAStatus::ok();
+  }
+
+  ::ndk::ScopedAStatus hciEventReceived(const std::vector<uint8_t>& packet) override {
+    callbacks_->hciEventReceived(packet);
+    return ::ndk::ScopedAStatus::ok();
+  }
+  // ... aclDataReceived, scoDataReceived, isoDataReceived
+};
+```
+
+### 37.5.5 HCI 分组流
+
+通过协议栈的完整分组流：
+
+```mermaid
+graph LR
+    subgraph "Host (Android)"
+        APP["Profile Code"]
+        L2CAP["L2CAP"]
+        HCI_LAYER["HCI Layer (GD)"]
+        HAL_IMPL["HciHal Implementation"]
+        AIDL["AIDL Backend"]
+    end
+
+    subgraph "Controller"
+        FW["Bluetooth Firmware"]
+    end
+
+    APP -->|"L2CAP SDU"| L2CAP
+    L2CAP -->|"ACL Fragment"| HCI_LAYER
+    HCI_LAYER -->|"HCI Packet"| HAL_IMPL
+    HAL_IMPL -->|"sendAclData()"| AIDL
+    AIDL -->|"Binder IPC"| FW
+
+    FW -->|"Binder IPC"| AIDL
+    AIDL -->|"aclDataReceived()"| HAL_IMPL
+    HAL_IMPL -->|"HCI Event/Data"| HCI_LAYER
+    HCI_LAYER -->|"ACL Fragment"| L2CAP
+    L2CAP -->|"L2CAP SDU"| APP
+```
+
+### 37.5.6 蓝牙 Audio HAL
+
+除 HCI HAL 外，蓝牙音频还使用单独的 Audio HAL 接口来传输流式音频数据。这对
+A2DP 和 LE Audio 尤为重要。
+
+源文件：`hardware/interfaces/bluetooth/audio/aidl/`
+
+蓝牙 Audio HAL 支持多种会话类型：
+
+- A2DP 软件编码/解码
+- A2DP 硬件卸载编码/解码
+- LE Audio 软件编码/解码
+- LE Audio 硬件卸载
+- LE Audio 广播
+- HFP 软件编码/解码
+
+音频数据通过蓝牙协议栈与 Audio HAL 之间共享的快速消息队列（FMQ）流动。这
+避免了批量音频数据传输的 Binder IPC 开销。
+
+### 37.5.7 Snoop Logger
+
+HAL 层包含一个 snoop logger，用于捕获所有 HCI 流量以便调试：
+
+源文件：`packages/modules/Bluetooth/system/gd/hal/snoop_logger.h`
+
+Snoop 日志记录模式（通过开发者选项配置）：
+
+| 模式 | 常量（字符串值） | 说明 |
+|------|-------------------------|-------------|
+| 禁用 | `SnoopLogger::kBtSnoopLogModeDisabled` ("disabled") | 不记录 |
+| 过滤 | `SnoopLogger::kBtSnoopLogModeFiltered` ("filtered") | 仅记录头部，剥离数据 |
+| 完整 | `SnoopLogger::kBtSnoopLogModeFull` ("full") | 完整分组捕获 |
+| 内核 | `SnoopLogger::kBtSnoopLogModeKernel` ("kernel") | 通过内核监视器捕获 |
+
+Snoop 日志以 BTSnoop 格式写入，兼容 Wireshark 进行分析。
+
+---
+
+## 37.6 配对与绑定
+
+### 37.6.1 配对与绑定
+
+**配对**是在两台设备之间建立临时安全关系的过程。它涉及身份验证和密钥生成。
+
+**绑定**通过持久存储生成的密钥来扩展配对，使设备能够安全地重新连接而无需
+重新配对。
+
+### 37.6.2 安全管理器协议（SMP）
+
+SMP 处理 BLE 连接的配对过程。实现位于 `stack/smp/` 目录中。
+
+源文件：`packages/modules/Bluetooth/system/stack/smp/smp_int.h`
+
+#### 关联模型
+
+SMP 根据每台设备的 I/O 能力定义多种配对方法：
+
+```cpp
+typedef enum : uint8_t {
+  /* Legacy mode */
+  SMP_MODEL_ENCRYPTION_ONLY = 0,        /* Just Works */
+  SMP_MODEL_PASSKEY = 1,                /* Passkey Entry (input) */
+  SMP_MODEL_OOB = 2,                    /* Out of Band */
+  SMP_MODEL_KEY_NOTIF = 3,              /* Passkey Entry (display) */
+  /* Secure Connections mode */
+  SMP_MODEL_SEC_CONN_JUSTWORKS = 4,     /* Just Works (SC) */
+  SMP_MODEL_SEC_CONN_NUM_COMP = 5,      /* Numeric Comparison */
+  SMP_MODEL_SEC_CONN_PASSKEY_ENT = 6,   /* Passkey Entry (SC) */
+  SMP_MODEL_SEC_CONN_PASSKEY_DISP = 7,  /* Passkey Display (SC) */
+  SMP_MODEL_SEC_CONN_OOB = 8,           /* OOB (SC) */
+  SMP_MODEL_OUT_OF_RANGE = 9,
+} tSMP_ASSO_MODEL;
+```
+
+关联模型根据 I/O 能力交换来选择：
+
+```mermaid
+graph TB
+    START["I/O Capability Exchange"]
+    START --> SC{"Secure Connections<br/>supported?"}
+    SC -->|"No"| LEGACY["Legacy Pairing"]
+    SC -->|"Yes"| SECURE["Secure Connections"]
+
+    LEGACY --> L_OOB{"OOB data<br/>available?"}
+    L_OOB -->|"Yes"| L_OOB_MODEL["OOB"]
+    L_OOB -->|"No"| L_IO{"I/O Capabilities"}
+    L_IO -->|"NoInput/NoOutput"| L_JW["Just Works<br/>(No MITM protection)"]
+    L_IO -->|"Display + Keyboard"| L_PK["Passkey Entry"]
+    L_IO -->|"Display only"| L_DISP["Passkey Display"]
+    L_IO -->|"Keyboard only"| L_KB["Passkey Input"]
+
+    SECURE --> S_OOB{"OOB data<br/>available?"}
+    S_OOB -->|"Yes"| S_OOB_MODEL["OOB (SC)"]
+    S_OOB -->|"No"| S_IO{"I/O Capabilities"}
+    S_IO -->|"NoInput/NoOutput"| S_JW["Just Works (SC)<br/>(No MITM protection)"]
+    S_IO -->|"Both have Display+Keyboard"| S_NC["Numeric Comparison<br/>(6-digit number)"]
+    S_IO -->|"One has Display, other Keyboard"| S_PK["Passkey Entry (SC)"]
+```
+
+#### SMP 状态机
+
+源文件：`packages/modules/Bluetooth/system/stack/smp/smp_main.cc`
+
+SMP 状态机有 17 个状态：
+
+```cpp
+const char* const smp_state_name[] = {
+    "SMP_STATE_IDLE",
+    "SMP_STATE_WAIT_APP_RSP",
+    "SMP_STATE_SEC_REQ_PENDING",
+    "SMP_STATE_PAIR_REQ_RSP",
+    "SMP_STATE_WAIT_CONFIRM",
+    "SMP_STATE_CONFIRM",
+    "SMP_STATE_RAND",
+    "SMP_STATE_PUBLIC_KEY_EXCH",
+    "SMP_STATE_SEC_CONN_PHS1_START",
+    "SMP_STATE_WAIT_COMMITMENT",
+    "SMP_STATE_WAIT_NONCE",
+    "SMP_STATE_SEC_CONN_PHS2_START",
+    "SMP_STATE_WAIT_DHK_CHECK",
+    "SMP_STATE_DHK_CHECK",
+    "SMP_STATE_ENCRYPTION_PENDING",
+    "SMP_STATE_BOND_PENDING",
+    "SMP_STATE_CREATE_LOCAL_SEC_CONN_OOB_DATA",
+    "SMP_STATE_MAX"
+};
+```
+
+以及驱动状态转换的 41 个事件：
+
+```cpp
+const char* const smp_event_name[] = {
+    "PAIRING_REQ_EVT",
+    "PAIRING_RSP_EVT",
+    "CONFIRM_EVT",
+    "RAND_EVT",
+    "PAIRING_FAILED_EVT",
+    "ENC_INFO_EVT",
+    "CENTRAL_ID_EVT",
+    "ID_INFO_EVT",
+    "ID_ADDR_EVT",
+    "SIGN_INFO_EVT",
+    "SECURITY_REQ_EVT",
+    "PAIR_PUBLIC_KEY_EVT",
+    "PAIR_DHKEY_CHECK_EVT",
+    "PAIR_KEYPRESS_NOTIFICATION_EVT",
+    "PAIR_COMMITMENT_EVT",
+    // ... and more
+};
+```
+
+#### SMP 命令（OTA 操作码）
+
+```cpp
+typedef enum : uint8_t {
+  SMP_OPCODE_PAIRING_REQ      = 0x01,
+  SMP_OPCODE_PAIRING_RSP      = 0x02,
+  SMP_OPCODE_CONFIRM           = 0x03,
+  SMP_OPCODE_RAND              = 0x04,
+  SMP_OPCODE_PAIRING_FAILED    = 0x05,
+  SMP_OPCODE_ENCRYPT_INFO      = 0x06,
+  SMP_OPCODE_CENTRAL_ID        = 0x07,
+  SMP_OPCODE_IDENTITY_INFO     = 0x08,
+  SMP_OPCODE_ID_ADDR           = 0x09,
+  // ...
+} tSMP_OPCODE;
+```
+
+### 37.6.3 安全连接配对流程
+
+安全连接（蓝牙 4.2 引入）使用 ECDH（椭圆曲线 Diffie-Hellman）进行密钥交换，
+提供针对被动窃听的保护。
+
+```mermaid
+sequenceDiagram
+    participant I as Initiator
+    participant R as Responder
+
+    Note over I,R: Phase 1: Feature Exchange
+    I->>R: Pairing Request (IO Cap, Auth Req, Key Size)
+    R->>I: Pairing Response (IO Cap, Auth Req, Key Size)
+
+    Note over I,R: Phase 2: Authentication (SC)
+    I->>R: Public Key (PKa)
+    R->>I: Public Key (PKb)
+    Note over I,R: Both compute DHKey = P256(SKx, PKy)
+
+    alt Numeric Comparison
+        I->>R: Commitment (Ca = f4(PKax, PKbx, Na, 0))
+        R->>I: Commitment (Cb = f4(PKbx, PKax, Nb, 0))
+        I->>R: Nonce (Na)
+        R->>I: Nonce (Nb)
+        Note over I,R: Both display 6-digit number<br/>Va = Vb = g2(PKax, PKbx, Na, Nb)
+        Note over I,R: User confirms match
+    else Passkey Entry
+        Note over I,R: 20 rounds of commitment exchange<br/>using passkey bits
+    else Just Works
+        Note over I,R: Same as Numeric Comparison<br/>but no user verification
+    end
+
+    Note over I,R: Phase 2: Key Confirmation
+    I->>R: DHKey Check (Ea)
+    R->>I: DHKey Check (Eb)
+
+    Note over I,R: Phase 3: Key Distribution
+    I->>R: Encryption Info (LTK)
+    I->>R: Central ID (EDIV, Rand)
+    I->>R: Identity Info (IRK)
+    I->>R: Identity Address
+    R->>I: Identity Info (IRK)
+    R->>I: Identity Address
+```
+
+### 37.6.4 密钥分发
+
+SMP 在绑定期间分发几种类型的密钥：
+
+| 密钥 | 用途 |
+|-----|---------|
+| **LTK**（长期密钥） | 加密未来的连接 |
+| **IRK**（身份解析密钥） | 解析可解析私有地址 |
+| **CSRK**（连接签名解析密钥） | 对未加密数据签名 |
+| **Link Key**（BR/EDR） | 跨传输密钥派生 |
+
+源文件：`packages/modules/Bluetooth/system/stack/smp/smp_act.cc`
+
+```cpp
+const tSMP_ACT smp_distribute_act[] = {
+    smp_generate_ltk,        /* SMP_SEC_KEY_TYPE_ENC  */
+    smp_send_id_info,        /* SMP_SEC_KEY_TYPE_ID   */
+    smp_generate_csrk,       /* SMP_SEC_KEY_TYPE_CSRK */
+    smp_set_derive_link_key  /* SMP_SEC_KEY_TYPE_LK   */
+};
+```
+
+### 37.6.5 经典蓝牙配对
+
+经典蓝牙使用由 `stack/btm/` 中的蓝牙管理器（BTM）层管理的另一种配对机制。
+安全简单配对（SSP）协议支持：
+
+1. **数字比较**：两台设备都显示一个 6 位数字；用户确认它们匹配
+2. **密钥输入**：用户将一台设备上显示的密钥输入到另一台设备
+3. **Just Works**：自动配对，无需用户交互（无 MITM 保护）
+4. **带外（OOB）**：通过替代通道（NFC、二维码）交换密钥
+
+### 37.6.6 绑定状态管理
+
+设备管理器（`btif_dm.cc`）协调 Java 层与原生协议栈之间的配对过程：
+
+源文件：`packages/modules/Bluetooth/system/btif/src/btif_dm.cc`
+
+绑定状态转换会广播给应用程序：
+
+```mermaid
+stateDiagram-v2
+    [*] --> BOND_NONE
+    BOND_NONE --> BOND_BONDING : createBond
+    BOND_BONDING --> BOND_BONDED : pairing success
+    BOND_BONDING --> BOND_NONE : pairing failed/cancelled
+    BOND_BONDED --> BOND_NONE : removeBond
+```
+
+### 37.6.7 密钥存储
+
+绑定密钥持久存储在蓝牙配置文件（`/data/misc/bluedroid/bt_config.conf` 或通过
+GD 存储模块）中。
+
+源文件：`packages/modules/Bluetooth/system/gd/storage/`
+
+存储模块管理：
+
+- 按蓝牙地址标识的每设备分区
+- 密钥材料（LTK、IRK、CSRK、Link Key）
+- 设备属性（名称、类别、类型、特性）
+- 配置文件特定的数据（GATT 缓存、HFP 版本、AVRCP 特性）
+
+密钥存储使用 `BluetoothKeystoreService` 进行安全的密钥管理：
+
+源文件：`packages/modules/Bluetooth/android/app/src/com/android/bluetooth/btservice/bluetoothKeystore/BluetoothKeystoreService.java`
+
+存储键在集中的头文件中定义：
+
+源文件：`packages/modules/Bluetooth/system/gd/storage/config_keys.h`
+
+```cpp
+#define BTIF_STORAGE_SECTION_ADAPTER "Adapter"
+#define BTIF_STORAGE_KEY_ADDR_TYPE "AddrType"
+#define BTIF_STORAGE_KEY_ADDRESS "Address"
+#define BTIF_STORAGE_KEY_ALIAS "Aliase"
+#define BTIF_STORAGE_KEY_DEV_CLASS "DevClass"
+#define BTIF_STORAGE_KEY_DEV_TYPE "DevType"
+#define BTIF_STORAGE_KEY_HFP_VERSION "HfpVersion"
+#define BTIF_STORAGE_KEY_GATT_CLIENT_DB_HASH "GattClientDatabaseHash"
+#define BTIF_STORAGE_KEY_GATT_CLIENT_SUPPORTED "GattClientSupportedFeatures"
+#define BTIF_STORAGE_KEY_HID_DESCRIPTOR "HidDescriptor"
+// ... many more per-profile keys
+```
+
+配置文件使用简单的 INI 风格格式，其中每个已配对设备都有自己的分区：
+
+```ini
+[Adapter]
+Address = AA:BB:CC:DD:EE:FF
+DiscoveryTimeout = 120
+
+[11:22:33:44:55:66]
+Name = MyHeadphones
+DevClass = 240404
+DevType = 1
+AddrType = 0
+Aliase = User-Friendly Name
+LinkKey = 0123456789abcdef0123456789abcdef
+LinkKeyType = 4
+PinLength = 0
+HfpVersion = 263
+AvrcpControllerVersion = 259
+GattClientSupportedFeatures = 03
+```
+
+### 37.6.8 跨传输密钥派生
+
+蓝牙 4.2 引入了跨传输密钥派生（CTKD）。借助 CTKD，通过一种传输（LE 或
+BR/EDR）绑定的设备可以自动派生另一种传输的密钥。这意味着一次配对操作即可
+保护经典连接和 BLE 连接。
+
+SMP 状态机通过 `SMP_SEC_KEY_TYPE_LK` 密钥类型处理 CTKD。它使用
+`smp_set_derive_link_key` 动作从 LE LTK 生成 BR/EDR Link Key。
+
+### 37.6.9 安全级别
+
+蓝牙定义了多个安全级别：
+
+| 级别 | 名称 | 身份验证 | 加密 | 要求 |
+|-------|------|----------------|------------|--------------|
+| 1 | 无安全 | 否 | 否 | 无 |
+| 2 | 未验证 | 否 | 是 | 仅加密 |
+| 3 | 已验证 | 是 | 是 | MITM 保护 |
+| 4 | 已验证（SC） | 是 | 是 | 安全连接 + MITM |
+
+服务可以指定其所需的安全级别。例如，支付服务将要求级别 4，而通用数据服务
+可能接受级别 2。
+
+---
+
+## 37.7 蓝牙音频
+
+### 37.7.1 音频架构概述
+
+AOSP 中的蓝牙音频涉及三个主要子系统：蓝牙协议栈（编解码器协商、流管理）、
+Audio HAL（音频数据路径）和 AudioFlinger（Android 的音频服务器）。
+
+```mermaid
+graph TB
+    subgraph "Audio Framework"
+        AF["AudioFlinger"]
+        AP["AudioPolicyService"]
+    end
+
+    subgraph "Bluetooth Audio HAL"
+        BT_AHAL["BluetoothAudioProvider<br/>(AIDL Audio HAL)"]
+        FMQ["Fast Message Queue<br/>(Shared Memory)"]
+    end
+
+    subgraph "Bluetooth Stack"
+        A2DP_ENC["A2DP Encoding<br/>(a2dp_encoding.h)"]
+        CODEC["Codec Selection<br/>(a2dp_codec_config.cc)"]
+        AVDTP_L["AVDTP Layer"]
+        L2CAP_A["L2CAP"]
+    end
+
+    subgraph "Offload Path (Optional)"
+        DSP["Audio DSP"]
+    end
+
+    AF -->|"PCM Audio"| BT_AHAL
+    BT_AHAL -->|"PCM via FMQ"| A2DP_ENC
+    BT_AHAL -.->|"Offload"| DSP
+    A2DP_ENC -->|"Encoded Audio"| AVDTP_L
+    AVDTP_L --> L2CAP_A
+    CODEC --> A2DP_ENC
+    AP --> AF
+    DSP -.->|"Encoded Audio"| L2CAP_A
+```
+
+### 37.7.2 A2DP 编解码器协商
+
+A2DP 编解码器选择是一个多步骤的过程，涉及能力交换、用户偏好和硬件支持。
+
+源文件：`packages/modules/Bluetooth/system/stack/a2dp/a2dp_codec_config.cc`
+
+编解码器框架同时支持标准编解码器和供应商特定的编解码器：
+
+```cpp
+#include "stack/include/a2dp_aac.h"
+#include "stack/include/a2dp_sbc.h"
+#include "stack/include/a2dp_vendor.h"
+#include "stack/include/a2dp_vendor_aptx_constants.h"
+#include "stack/include/a2dp_vendor_aptx_hd_constants.h"
+#include "stack/include/a2dp_vendor_ldac_constants.h"
+// ...
+
+#if !defined(EXCLUDE_NONSTANDARD_CODECS)
+#include "stack/include/a2dp_vendor_aptx.h"
+#include "stack/include/a2dp_vendor_aptx_hd.h"
+#include "stack/include/a2dp_vendor_ldac.h"
+#include "stack/include/a2dp_vendor_lhdcv5.h"
+#include "stack/include/a2dp_vendor_opus.h"
+#endif
+```
+
+从 OTA 能力中识别编解码器：
+
+```cpp
+std::optional<CodecId> ParseCodecId(uint8_t const media_codec_capabilities[]) {
+  tA2DP_CODEC_TYPE codec_type = A2DP_GetCodecType(media_codec_capabilities);
+  switch (codec_type) {
+    case A2DP_MEDIA_CT_SBC:
+      return CodecId::SBC;
+    case A2DP_MEDIA_CT_AAC:
+      return CodecId::AAC;
+    case A2DP_MEDIA_CT_NON_A2DP: {
+      uint32_t vendor_id = A2DP_VendorCodecGetVendorId(media_codec_capabilities);
+      uint16_t codec_id = A2DP_VendorCodecGetCodecId(media_codec_capabilities);
+      return static_cast<CodecId>(
+          VendorCodecId(static_cast<uint16_t>(vendor_id), codec_id));
+    }
+    default: return std::nullopt;
+  }
+}
+```
+
+### 37.7.3 支持的 A2DP 编解码器
+
+| 编解码器 | 类型 | 比特率 | 特性 |
+|-------|------|---------|----------|
+| **SBC** | 强制 | 198-345 kbps | 通用兼容性 |
+| **AAC** | 标准 | 最高 320 kbps | 在与 SBC 相同的比特率下质量更好 |
+| **aptX** | 供应商（高通） | 352 kbps | 低延迟、更好的质量 |
+| **aptX HD** | 供应商（高通） | 576 kbps | 24 位高分辨率音频 |
+| **LDAC** | 供应商（索尼） | 330/660/990 kbps | 最高质量、自适应比特率 |
+| **Opus** | 供应商 | 可变 | 开源、通用 |
+| **LC3** | 标准（LE Audio） | 可变 | LE Audio 的新标准 |
+
+每个编解码器都有自己的源文件：
+
+源文件：`packages/modules/Bluetooth/system/stack/a2dp/`
+
+```
+a2dp_sbc.cc                  -- SBC codec handling
+a2dp_sbc_encoder.cc          -- SBC encoding
+a2dp_aac.cc                  -- AAC codec handling
+a2dp_aac_encoder.cc          -- AAC encoding
+a2dp_vendor_aptx.cc          -- aptX codec handling
+a2dp_vendor_aptx_encoder.cc  -- aptX encoding
+a2dp_vendor_aptx_hd.cc       -- aptX HD codec handling
+a2dp_vendor_aptx_hd_encoder.cc -- aptX HD encoding
+a2dp_vendor_ldac.cc          -- LDAC codec handling
+a2dp_vendor_ldac_encoder.cc  -- LDAC encoding
+a2dp_vendor_opus.cc          -- Opus codec handling
+a2dp_vendor_opus_encoder.cc  -- Opus encoding
+```
+
+### 37.7.4 编解码器协商流程
+
+```mermaid
+sequenceDiagram
+    participant SRC as Source (Phone)
+    participant SNK as Sink (Headphones)
+    participant HAL as Audio HAL
+
+    Note over SRC,SNK: AVDTP Signaling
+    SRC->>SNK: Discover (get SEPs)
+    SNK-->>SRC: SEP list with capabilities
+
+    SRC->>HAL: get_a2dp_configuration(remote_seps, user_prefs)
+    HAL-->>SRC: Best codec configuration
+
+    SRC->>SNK: Set Configuration (selected codec)
+    SNK-->>SRC: Accept
+
+    SRC->>SNK: Open Stream
+    SNK-->>SRC: Accept
+
+    SRC->>SNK: Start Stream
+    SNK-->>SRC: Accept
+
+    Note over SRC,SNK: Audio Streaming
+    SRC->>SNK: Media Packets (encoded audio)
+```
+
+Audio HAL 通过 provider 接口参与编解码器选择：
+
+源文件：`packages/modules/Bluetooth/system/audio_hal_interface/a2dp_encoding.h`
+
+```cpp
+namespace bluetooth::audio::a2dp::provider {
+
+// Query the codec selection from the audio HAL.
+// The HAL picks the best audio configuration based on remote SEPs.
+std::optional<a2dp_configuration> get_a2dp_configuration(
+    RawAddress peer_address,
+    std::vector<a2dp_remote_capabilities> const& remote_seps,
+    btav_a2dp_codec_config_t const& user_preferences,
+    std::optional<::bluetooth::a2dp::CodecId> user_preferred_codec_id,
+    bool is_source);
+
+// Query the codec parameters from the audio HAL.
+tA2DP_STATUS parse_a2dp_configuration(
+    ::bluetooth::a2dp::CodecId codec_id,
+    const uint8_t* codec_info,
+    btav_a2dp_codec_config_t* codec_parameters,
+    std::vector<uint8_t>* vendor_specific_parameters);
+
+}  // namespace provider
+```
+
+### 37.7.5 软件编码与硬件卸载编码
+
+AOSP 支持两种音频数据路径：
+
+**软件编码**：PCM 音频从 AudioFlinger 流经蓝牙 Audio HAL 的 FMQ 到达蓝牙
+协议栈。协议栈使用软件编解码器（SBC、AAC、LDAC 等）对其进行编码，并通过
+L2CAP 发送编码后的数据。
+
+**硬件卸载**：PCM 音频直接从音频 DSP 路由到蓝牙控制器的硬件编码器。它绕过
+主机 CPU。这降低了功耗和延迟。
+
+源文件：`packages/modules/Bluetooth/system/audio_hal_interface/a2dp_encoding.h`
+
+```cpp
+// Check if new bluetooth_audio is running with offloading encoders
+bool is_hal_offloading();
+
+// Initialize BluetoothAudio HAL: openProvider
+bool init(bluetooth::common::MessageLoopThread* message_loop,
+          StreamCallbacks const* stream_callbacks, bool offload_enabled);
+```
+
+`StreamCallbacks` 接口管理音频生命周期：
+
+```cpp
+class StreamCallbacks {
+public:
+  virtual Status StartStream(bool low_latency) const { return Status::FAILURE; }
+  virtual Status SuspendStream() const { return Status::FAILURE; }
+  virtual Status StopStream() const { return SuspendStream(); }
+  virtual Status SetLatencyMode(bool low_latency) const { return Status::FAILURE; }
+};
+```
+
+### 37.7.6 Audio HAL AIDL 接口
+
+蓝牙 Audio HAL 使用 AIDL 接口进行通信：
+
+源文件：`packages/modules/Bluetooth/system/audio_hal_interface/aidl/`
+
+```
+client_interface_aidl.h          -- Client interface to Audio HAL
+client_interface_aidl.cc         -- Implementation
+bluetooth_audio_port_impl.h     -- Audio port implementation
+bluetooth_audio_port_impl.cc    -- Port callbacks
+a2dp/                            -- A2DP-specific audio handling
+le_audio_software_aidl.h        -- LE Audio software encoding
+le_audio_software_aidl.cc       -- Implementation
+hfp_client_interface_aidl.h     -- HFP audio interface
+hfp_client_interface_aidl.cc    -- Implementation
+hearing_aid_software_encoding_aidl.h -- Hearing aid audio
+```
+
+### 37.7.7 音频路由集成
+
+当蓝牙音频设备连接时，音频策略服务将音频路由到该设备。`A2dpService` 向
+`AudioManager` 注册以获取设备回调：
+
+源文件：`packages/modules/Bluetooth/android/app/src/com/android/bluetooth/a2dp/A2dpService.java`
+
+```java
+public class A2dpService extends ConnectableProfile {
+    private final AudioManager mAudioManager;
+    private final AudioManagerAudioDeviceCallback mAudioManagerAudioDeviceCallback =
+            new AudioManagerAudioDeviceCallback();
+
+    // The active device is the one currently receiving audio
+    @GuardedBy("mStateMachines")
+    private BluetoothDevice mActiveDevice;
+}
+```
+
+完整的音频路由链：
+
+```mermaid
+graph LR
+    subgraph "Audio Source"
+        MEDIA["Media Player"]
+    end
+
+    subgraph "Audio Framework"
+        AT["AudioTrack"]
+        AF["AudioFlinger"]
+        APS["AudioPolicyService"]
+    end
+
+    subgraph "Bluetooth Audio HAL"
+        PROVIDER["IBluetoothAudioProvider"]
+        PORT["IBluetoothAudioPort"]
+    end
+
+    subgraph "Bluetooth Stack"
+        A2DP["A2DP Encoder"]
+        AVDTP["AVDTP"]
+    end
+
+    subgraph "Transport"
+        L2CAP["L2CAP"]
+        HCI["HCI ACL"]
+    end
+
+    MEDIA --> AT
+    AT --> AF
+    APS -->|"Route to BT"| AF
+    AF --> PROVIDER
+    PROVIDER -->|"FMQ (PCM)"| PORT
+    PORT --> A2DP
+    A2DP -->|"Encoded frames"| AVDTP
+    AVDTP --> L2CAP
+    L2CAP --> HCI
+```
+
+### 37.7.8 LE Audio
+
+LE Audio 是蓝牙音频的一次代际飞跃，引入了：
+
+- **LC3 编解码器**：强制编解码器，在一半比特率下提供比 SBC 更好的质量
+- **多流音频**：到左/右耳机的独立流
+- **广播音频**：Auracast——一个源，众多听众
+- **同步通道**：为音频传输提供有保证的时序
+
+源文件：`packages/modules/Bluetooth/android/app/src/com/android/bluetooth/le_audio/LeAudioService.java`
+
+LE Audio 使用连接同步流（CIS）进行点对点音频，使用广播同步流（BIS）进行
+一对多广播。
+
+LE Audio 的原生音频接口：
+
+源文件：`packages/modules/Bluetooth/system/audio_hal_interface/`
+
+```
+le_audio_software.h          -- LE Audio software encoding interface
+le_audio_software.cc         -- Implementation
+le_audio_software_aidl.h     -- AIDL-based implementation
+le_audio_software_aidl.cc    -- Implementation
+```
+
+### 37.7.9 HFP 音频
+
+HFP 音频使用 SCO（同步面向连接）链路进行语音通话。HFP 客户端接口管理音频
+连接：
+
+源文件：`packages/modules/Bluetooth/system/audio_hal_interface/hfp_client_interface.h`
+
+HFP 音频支持：
+
+- **CVSD**：窄带编解码器（8 kHz，强制）
+- **mSBC**：宽带编解码器（16 kHz，可选但广泛支持）
+- **LC3**：超宽带编解码器（32 kHz，蓝牙 5.3 新增）
+
+#### 语音的 SCO 与 ISO 对比
+
+经典 HFP 使用 SCO 链路进行双向语音音频。SCO 提供：
+
+- 固定的 64 kbps 带宽
+- 有保证的周期性时隙
+- 低延迟（约 10 毫秒）
+
+LE Audio 转而使用 ISO（同步）通道，后者提供：
+
+- 可变带宽
+- 更好的抗错误能力
+- 支持多个流
+- 广播能力
+
+在 Android 17 中，决定 HFP SCO 链路何时建立的是音频框架，而不是蓝牙协议栈。
+HFP 配置文件（`HeadsetService` 和 `HeadsetStateMachine`）会查询
+`HeadsetSystemInterface.isScoManagedByAudioEnabled()`。当它被设置时，配置文件
+将 SCO 音频启动延迟到音频框架的通信设备路由。配置文件不会自行驱动启动。该
+交接的框架侧——已弃用的 `startBluetoothSco()` 路径、`setCommunicationDevice()`
+以及 audio HAL 的 `IBluetooth.setScoConfig()` 调用——见第 15 章 15.12 节。
+
+### 37.7.10 音频延迟与质量
+
+蓝牙音频存在来自编码、缓冲和无线传输的固有延迟。AOSP 提供了将延迟最小化的
+机制：
+
+源文件：`packages/modules/Bluetooth/system/audio_hal_interface/a2dp_encoding.h`
+
+```cpp
+// Set low latency buffer mode allowed or disallowed
+void set_audio_low_latency_mode_allowed(bool allowed);
+```
+
+典型的延迟范围：
+
+| 传输 | 编解码器 | 典型延迟 |
+|-----------|-------|----------------|
+| A2DP | SBC | 150-250 毫秒 |
+| A2DP | aptX Low Latency | 40-80 毫秒 |
+| A2DP | AAC | 100-200 毫秒 |
+| LE Audio | LC3 | 20-40 毫秒 |
+| HFP | mSBC | 30-50 毫秒 |
+
+动态音频缓冲特性（DAB）允许运行时调整缓冲区大小：
+
+源文件：`packages/modules/Bluetooth/system/gd/hci/controller_impl.h`
+
+```cpp
+virtual uint32_t GetDabSupportedCodecs() const override;
+virtual const std::array<DynamicAudioBufferCodecCapability, 32>&
+    GetDabCodecCapabilities() const override;
+virtual void SetDabAudioBufferTime(uint16_t buffer_time_ms) override;
+```
+
+### 37.7.11 编解码器可扩展性
+
+AOSP 通过 Audio HAL provider 支持硬件定义的编解码器扩展：
+
+源文件：`packages/modules/Bluetooth/system/audio_hal_interface/aidl/provider_info.h`
+
+这允许 SoC 供应商添加专有编解码器而无需修改蓝牙协议栈。provider 报告其支持
+的编解码器。在编解码器协商期间，协议栈查询 provider，以确定连接设备是否有
+可用的硬件加速编解码器。
+
+---
+
+## 37.8 动手实践
+
+本节提供用于探索蓝牙协议栈的实践练习。
+
+### 37.8.1 通过 ADB 检查蓝牙状态
+
+检查当前的蓝牙适配器状态：
+
+```bash
+# Check if Bluetooth is enabled
+adb shell settings get global bluetooth_on
+
+# Get the Bluetooth adapter address
+adb shell settings get secure bluetooth_address
+
+# Dump Bluetooth service state
+adb shell dumpsys bluetooth_manager
+
+# Dump detailed adapter service information
+adb shell dumpsys bluetooth_manager AdapterService
+```
+
+### 37.8.2 捕获 HCI 日志
+
+启用完整的 HCI snoop 日志以便分析：
+
+```bash
+# Enable HCI snoop log via developer options
+adb shell setprop persist.bluetooth.btsnooplogmode full
+
+# Restart Bluetooth to apply
+adb shell cmd bluetooth_manager disable
+adb shell cmd bluetooth_manager enable
+
+# Pull the snoop log
+adb pull /data/misc/bluetooth/logs/btsnoop_hci.log
+
+# Open in Wireshark
+wireshark btsnoop_hci.log
+```
+
+### 37.8.3 列出已配对设备
+
+使用 `bt_config.conf` 文件检查存储的绑定信息：
+
+```bash
+# View the Bluetooth config file (requires root)
+adb root
+adb shell cat /data/misc/bluedroid/bt_config.conf
+```
+
+配置文件使用 INI 格式，包含按设备划分的分区：
+
+```ini
+[Adapter]
+Address = AA:BB:CC:DD:EE:FF
+DiscoveryTimeout = 120
+
+[11:22:33:44:55:66]
+Name = MyHeadphones
+DevClass = 240404
+DevType = 1
+AddrType = 0
+LinkKey = 0123456789abcdef0123456789abcdef
+LinkKeyType = 4
+```
+
+### 37.8.4 探索配置文件连接
+
+查询活动的蓝牙配置文件连接：
+
+```bash
+# List connected A2DP devices
+adb shell dumpsys bluetooth_manager A2dpService
+
+# List connected HFP devices
+adb shell dumpsys bluetooth_manager HeadsetService
+
+# List GATT connections
+adb shell dumpsys bluetooth_manager GattService
+```
+
+### 37.8.5 从命令行进行 BLE 扫描
+
+AOSP 不附带 BlueZ 命令行工具（`btmgmt`、`bluetoothctl`）；而是通过
+`cmd bluetooth_manager` 和 logcat 来检查 BLE 扫描：
+
+```bash
+# Start a scan from an app (e.g. via BluetoothLeScanner), then
+# observe logcat for scan activity:
+adb logcat -s BtGatt.ScanManager
+```
+
+### 37.8.6 监视蓝牙事件
+
+实时观察蓝牙状态变化和配置文件事件：
+
+```bash
+# Filter logcat for Bluetooth events
+adb logcat -s BluetoothAdapter BluetoothManagerService \
+    BluetoothService AdapterService bt_btif_core
+
+# Monitor SMP pairing
+adb logcat -s smp bt_btif_dm
+
+# Monitor A2DP codec selection
+adb logcat -s bluetooth-a2dp bt_btif_av
+
+# Monitor GATT operations
+adb logcat -s BtGatt
+```
+
+### 37.8.7 构建和测试蓝牙更改
+
+仅构建蓝牙模块：
+
+```bash
+# Build the Bluetooth APEX
+m com.android.bt
+
+# Build only the native stack
+m libbt-stack
+
+# Build and run Bluetooth unit tests
+atest --host bluetooth_test_gd_unit
+atest BluetoothInstrumentationTests
+```
+
+### 37.8.8 使用蓝牙 shell 命令
+
+蓝牙服务公开了一个用于测试的 shell 接口：
+
+```bash
+# Access the Bluetooth shell
+adb shell cmd bluetooth_manager
+
+# Example commands:
+adb shell cmd bluetooth_manager enable
+adb shell cmd bluetooth_manager disable
+adb shell cmd bluetooth_manager wait-for-state:STATE_ON
+```
+
+### 37.8.9 分析 A2DP 编解码器配置
+
+检查当前的 A2DP 编解码器配置：
+
+```bash
+# Dump A2DP codec status
+adb shell dumpsys bluetooth_manager A2dpService | grep -i codec
+
+# Check codec offload support
+adb shell getprop persist.bluetooth.a2dp_offload.disabled
+adb shell getprop ro.bluetooth.a2dp_offload.supported
+```
+
+### 37.8.10 编写简单的 BLE 扫描器
+
+一个最小的 BLE 扫描应用程序：
+
+```java
+public class BleScanActivity extends Activity {
+    private BluetoothLeScanner scanner;
+
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+
+        BluetoothManager btManager =
+            (BluetoothManager) getSystemService(Context.BLUETOOTH_SERVICE);
+        BluetoothAdapter adapter = btManager.getAdapter();
+        scanner = adapter.getBluetoothLeScanner();
+
+        ScanSettings settings = new ScanSettings.Builder()
+            .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+            .build();
+
+        // Filter for a specific service UUID
+        ScanFilter filter = new ScanFilter.Builder()
+            .setServiceUuid(ParcelUuid.fromString(
+                "0000180d-0000-1000-8000-00805f9b34fb")) // Heart Rate
+            .build();
+
+        scanner.startScan(
+            List.of(filter), settings, new ScanCallback() {
+                @Override
+                public void onScanResult(int callbackType, ScanResult result) {
+                    BluetoothDevice device = result.getDevice();
+                    int rssi = result.getRssi();
+                    Log.d("BLE", "Found: " + device + " RSSI: " + rssi);
+                }
+            });
+    }
+}
+```
+
+### 37.8.11 编写 GATT 服务器
+
+一个公开自定义服务的最小 GATT 服务器：
+
+```java
+public class GattServerActivity extends Activity {
+    private BluetoothGattServer gattServer;
+
+    // Custom service and characteristic UUIDs
+    private static final UUID SERVICE_UUID =
+        UUID.fromString("12345678-1234-1234-1234-123456789abc");
+    private static final UUID CHAR_UUID =
+        UUID.fromString("12345678-1234-1234-1234-123456789abd");
+
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+
+        BluetoothManager btManager =
+            (BluetoothManager) getSystemService(Context.BLUETOOTH_SERVICE);
+
+        gattServer = btManager.openGattServer(this,
+            new BluetoothGattServerCallback() {
+                @Override
+                public void onConnectionStateChange(
+                        BluetoothDevice device, int status, int newState) {
+                    Log.d("GATT", "Connection state: " + newState);
+                }
+
+                @Override
+                public void onCharacteristicReadRequest(
+                        BluetoothDevice device, int requestId, int offset,
+                        BluetoothGattCharacteristic characteristic) {
+                    gattServer.sendResponse(device, requestId,
+                        BluetoothGatt.GATT_SUCCESS, 0,
+                        "Hello BLE".getBytes());
+                }
+            });
+
+        // Create service
+        BluetoothGattService service = new BluetoothGattService(
+            SERVICE_UUID, BluetoothGattService.SERVICE_TYPE_PRIMARY);
+
+        // Create characteristic
+        BluetoothGattCharacteristic characteristic =
+            new BluetoothGattCharacteristic(CHAR_UUID,
+                BluetoothGattCharacteristic.PROPERTY_READ,
+                BluetoothGattCharacteristic.PERMISSION_READ);
+        service.addCharacteristic(characteristic);
+
+        gattServer.addService(service);
+    }
+}
+```
+
+### 37.8.12 使用 Pandora 进行实验
+
+AOSP 包含 Pandora 蓝牙测试框架，它为自动化蓝牙测试提供了基于 gRPC 的接口：
+
+目录：`packages/modules/Bluetooth/tests/pandora/`（共享的 protos 位于
+`external/pandora/`）
+
+Pandora 支持对蓝牙操作进行编程控制，用于一致性测试，包括配对、配置文件连
+接和数据传输。
+
+### 37.8.13 追踪完整协议栈
+
+要从 Java 到 HCI 追踪蓝牙操作，请在每一层启用日志：
+
+```bash
+# Framework layer
+adb shell setprop log.tag.BluetoothAdapter VERBOSE
+
+# Service layer
+adb shell setprop log.tag.BluetoothManagerService VERBOSE
+adb shell setprop log.tag.AdapterService VERBOSE
+
+# Profile layer
+adb shell setprop log.tag.A2dpService VERBOSE
+adb shell setprop log.tag.HeadsetService VERBOSE
+
+# Native layer
+adb shell setprop persist.bluetooth.btsnooplogmode full
+
+# Collect all logs
+adb logcat -b all > bluetooth_trace.log
+```
+
+### 37.8.14 理解蓝牙配置文件
+
+检查并理解持久化的蓝牙配置：
+
+```bash
+# Location of the config file
+adb root
+adb shell ls -la /data/misc/bluedroid/bt_config.conf
+
+# Count the number of bonded devices
+adb shell grep -c '^\[' /data/misc/bluedroid/bt_config.conf
+
+# List bonded device addresses
+adb shell grep '^\[.*:.*:.*\]' /data/misc/bluedroid/bt_config.conf
+```
+
+### 37.8.15 调试配对问题
+
+当蓝牙配对失败时，使用以下调试技术：
+
+```bash
+# Watch SMP events in real-time
+adb logcat -s smp bt_btif_dm bt_smp | grep -E "SMP_STATE|smp_sm_event|pairing"
+
+# Check the HCI snoop log for pairing packets:
+# 1. Enable full snoop logging
+adb shell setprop persist.bluetooth.btsnooplogmode full
+# 2. Reproduce the pairing
+# 3. Pull and analyze the log
+adb pull /data/misc/bluetooth/logs/btsnoop_hci.log
+# 4. Open in Wireshark, filter: "btsmp"
+```
+
+常见的配对失败原因：
+
+- **超时**（30 秒）：一台设备未及时响应
+- **身份验证失败**：密钥不匹配或用户拒绝
+- **加密失败**：密钥生成或交换错误
+- **重复尝试**：失败尝试次数过多，设备被暂时阻止
+
+### 37.8.16 监视 LE Audio
+
+LE Audio 引入了可以用特定过滤器调试的新概念：
+
+```bash
+# Monitor LE Audio service
+adb logcat -s LeAudioService LeAudioStateMachine
+
+# Monitor broadcast audio
+adb logcat -s LeAudioBroadcast BassClientService
+
+# Monitor volume control
+adb logcat -s VolumeControlService
+
+# Monitor coordinated sets
+adb logcat -s CsipSetCoordinatorService
+
+# Monitor the LE Audio Peripheral (acceptor) role (Android 17)
+adb logcat -s LeAudioPeripheralService PeripheralPolicyManager
+
+# Monitor Channel Sounding / distance measurement (Android 17)
+adb logcat -s DistanceMeasurementManager DistanceMeasurementNativeCallback
+```
+
+### 37.8.17 蓝牙系统属性
+
+控制蓝牙行为的关键系统属性：
+
+```bash
+# Check all Bluetooth-related properties
+adb shell getprop | grep -i bluetooth
+
+# Important properties:
+adb shell getprop persist.bluetooth.btsnooplogmode     # Snoop log mode
+adb shell getprop persist.bluetooth.a2dp_offload.disabled  # A2DP offload
+adb shell getprop ro.bluetooth.a2dp_offload.supported  # Offload support
+adb shell getprop bluetooth.profile.a2dp.source.enabled # A2DP source
+adb shell getprop bluetooth.profile.hfp.ag.enabled     # HFP AG
+adb shell getprop bluetooth.profile.gatt.enabled       # GATT
+```
+
+### 37.8.18 自定义配置文件开发
+
+要在应用程序中实现自定义蓝牙配置文件：
+
+1. **对于经典蓝牙**：使用 RFCOMM 服务器套接字：
+
+```java
+BluetoothAdapter adapter = BluetoothAdapter.getDefaultAdapter();
+UUID MY_UUID = UUID.fromString("fa87c0d0-afac-11de-8a39-0800200c9a66");
+BluetoothServerSocket serverSocket =
+    adapter.listenUsingRfcommWithServiceRecord("MyService", MY_UUID);
+
+// Accept connections in a background thread
+BluetoothSocket socket = serverSocket.accept();
+InputStream in = socket.getInputStream();
+OutputStream out = socket.getOutputStream();
+// ... handle data
+```
+
+2. **对于 BLE**：使用 GATT 服务器/客户端（参见 37.8.10 和 37.8.11 节）
+
+3. **对于 L2CAP CoC**（面向连接的通道）：
+
+```java
+// Server side
+BluetoothServerSocket l2capServer =
+    adapter.listenUsingL2capChannel();
+int psm = l2capServer.getPsm(); // Dynamic PSM assigned
+
+// Client side
+BluetoothSocket l2capClient =
+    device.createL2capChannel(psm);
+l2capClient.connect();
+```
+
+### 37.8.19 Rootcanal：虚拟蓝牙控制器
+
+AOSP 包含 Rootcanal，这是一个用于在模拟器上测试的虚拟蓝牙控制器。Rootcanal
+模拟蓝牙控制器而不需要真实硬件，允许开发者在 Android 模拟器上测试蓝牙功能。
+
+GD HAL 有一个特定的 Rootcanal 后端：
+
+源文件：`packages/modules/Bluetooth/system/gd/hal/hci_hal_impl_host_rootcanal.cc`
+
+```bash
+# Run the host unit tests (the host build links the Rootcanal HAL backend)
+atest --host bluetooth_test_gd_unit
+```
+
+---
+
+## 总结
+
+Android 的蓝牙子系统是一个多层、多语言的协议栈。它从框架 SDK
+（`BluetoothManager`、`BluetoothAdapter`）跨越系统服务
+（`BluetoothManagerService`、`AdapterService`），向下贯穿原生的
+Gabeldorsche/Fluoride C++/Rust 协议栈。底部是与蓝牙控制器固件接口的 AIDL
+HAL。
+
+关键的架构亮点：
+
+- **可更新的 APEX 模块**：整个蓝牙协议栈以 `com.android.bt` 发布，可通过
+  Google Play 系统更新独立于完整 OTA 更新进行更新。
+- **Gabeldorsche 迁移**：原生协议栈正从传统的 Fluoride（源自博通）架构逐步
+ 现代化为模块化的 Gabeldorsche 设计。这项工作从最底层（HCI、ACL）开始，逐
+ 向上推进。
+- **Rust 集成**：内存安全组件通过 `cxx` FFI 桥与 C++ 共存。Rust GATT 服务器
+  （现在位于自己的 `private_gatt` crate 中）使用仲裁器与 C++ 客户端共享
+  ATT 承载。Android 17 添加了一个 Rust LE Audio crate，其中容纳了同步
+  （CIG/CIS、BIS）和周期广播同步管理器。
+- **AIDL HAL**：蓝牙 HAL 在 HCI 层运行。它提供了清晰的供应商抽象，仅有六个
+  方法（`initialize`、`close`，外加四个分别用于 HCI 命令、ACL、SCO 和 ISO
+  分组的发送方法）。
+- **丰富的配置文件支持**：实现了超过 25 个蓝牙配置文件，从经典的
+  A2DP/HFP 到带有 BAP、CSIP、VCP、MCP 和 TBS 的现代 LE Audio。Android 17
+  添加了 LE Audio 外设（BAP 接受方）角色，使手机本身可以充当对等主机的
+  LE Audio 扬声器/麦克风。
+- **测距**：信道探测距离测量在 Android 17 中已完善。它具有强制执行的 LE
+  安全连接安全模型和更丰富的结果（NADM 攻击等级、远程发射功率、RSSI）。
+- **硬件卸载**：音频编码可以卸载到 SoC 的 DSP 以提高电源效率。Audio HAL
+  通过快速消息队列提供单独的数据路径。
+- **全面的安全**：SMP 实现了所有蓝牙配对模型，带有 17 状态的状态机，支持
+  传统和安全连接配对、跨传输密钥派生以及基于 RPA 的隐私。
+
+蓝牙代码库展示了许多 AOSP 模式。其中包括框架与服务之间的 binder IPC 以及
+到原生代码的 JNI 桥接。还包括用于协议管理的状态机（A2DP 有 4 个状态；HFP 有
+7 个；SMP 有 17 个）。最后一个模式是用于硬件可移植性的 HAL 抽象。理解这个
+协议栈有助于深入了解 Android 如何在其安全和权限框架内管理复杂的实时无线协
+议。
+
+### 关键源文件路径
+
+| 组件 | 路径 |
+|-----------|------|
+| 框架 API | `packages/modules/Bluetooth/framework/java/android/bluetooth/` |
+| BLE API | `packages/modules/Bluetooth/framework/java/android/bluetooth/le/` |
+| 系统服务 | `packages/modules/Bluetooth/service/src/` |
+| 蓝牙 APK | `packages/modules/Bluetooth/android/app/src/com/android/bluetooth/` |
+| AdapterService | `packages/modules/Bluetooth/android/app/src/com/android/bluetooth/btservice/` |
+| 配置文件服务 | `packages/modules/Bluetooth/android/app/src/com/android/bluetooth/{a2dp,hfp,gatt,...}/` |
+| Gabeldorsche (GD) | `packages/modules/Bluetooth/system/gd/` |
+| GD HAL | `packages/modules/Bluetooth/system/gd/hal/` |
+| GD HCI | `packages/modules/Bluetooth/system/gd/hci/` |
+| GD Storage | `packages/modules/Bluetooth/system/gd/storage/` |
+| BTIF（JNI 桥梁） | `packages/modules/Bluetooth/system/btif/` |
+| BTA（应用层） | `packages/modules/Bluetooth/system/bta/` |
+| 协议栈核心 | `packages/modules/Bluetooth/system/stack/` |
+| L2CAP | `packages/modules/Bluetooth/system/stack/l2cap/` |
+| SMP | `packages/modules/Bluetooth/system/stack/smp/` |
+| GATT | `packages/modules/Bluetooth/system/stack/gatt/` |
+| A2DP 编解码器 | `packages/modules/Bluetooth/system/stack/a2dp/` |
+| Rust GATT 服务器 | `packages/modules/Bluetooth/system/rust/private_gatt/` |
+| Rust LE Audio（ISO、PA 同步） | `packages/modules/Bluetooth/system/rust/src/le_audio/` |
+| LE Audio 外设（原生） | `packages/modules/Bluetooth/system/bta/le_audio/server/` |
+| 距离测量（CS） | `packages/modules/Bluetooth/system/gd/hci/distance_measurement_manager.h` |
+| Audio HAL 接口 | `packages/modules/Bluetooth/system/audio_hal_interface/` |
+| 蓝牙 AIDL HAL | `hardware/interfaces/bluetooth/aidl/` |
+| 蓝牙 Audio HAL | `hardware/interfaces/bluetooth/audio/aidl/` |
+| APEX 配置 | `packages/modules/Bluetooth/apex/` |
+| Floss（Linux） | `packages/modules/Bluetooth/floss/` |
+| Pandora 测试 | `packages/modules/Bluetooth/tests/pandora/` |
+
+### 延伸阅读
+
+蓝牙规范本身可从蓝牙 SIG 免费获取，地址为
+https://www.bluetooth.com/specifications/specs/ 。与 AOSP 相关的关键规范文
+档：
+
+- **Core Specification 6.0**：基础的蓝牙规范，定义了无线电、基带、L2CAP、
+  SDP、GAP 和 GATT 协议。它还定义了 AOSP 距离测量 API 所基于的信道探测特性。
+- **A2DP 1.4**：高级音频分发配置文件规范，定义了音频流传输过程和 SBC 编解
+  码器要求。
+- **HFP 1.9**：免提配置文件规范，支持 LC3 超宽带音频。
+- **AVRCP 1.6.2**：音频/视频远程控制配置文件，支持浏览和封面图片。
+- **LE Audio（BAP、CSIP、VCP 等）**：通过 LE 传输实现下一代蓝牙音频的规范
+  族。
+
+在 AOSP 内部，蓝牙团队在以下位置维护文档：
+
+- `packages/modules/Bluetooth/system/doc/` -- 原生协议栈设计文档
+- `packages/modules/Bluetooth/system/gd/docs/` -- Gabeldorsche 设计文档
+- `packages/modules/Bluetooth/system/gd/README.md` -- GD 概述

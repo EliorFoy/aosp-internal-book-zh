@@ -1,0 +1,508 @@
+---
+title: "附录 A：关键文件"
+description: "本附录是 AOSP 中最重要源文件的速查表。"
+---
+
+# 附录 A：关键文件
+
+本附录是 AOSP 中最重要源文件的速查表。各表按子系统对文件分组。每个标题都给出了讨论这些文件的章节。路径相对于 AOSP 根目录（`$AOSP/`）。
+
+---
+
+## 构建系统（第 2 章）
+
+| 文件路径 | 用途 |
+|-----------|---------|
+| `build/make/core/main.mk` | 顶层构建入口；包含所有其他 makefile |
+| `build/make/core/Makefile` | 用于镜像、OTA 和打包的传统构建规则 |
+| `build/make/core/definitions.mk` | 整个构建过程中使用的公共宏定义 |
+| `build/make/core/envsetup.mk` | 用于构建配置的环境变量设置 |
+| `build/make/core/product.mk` | 产品级构建变量定义 |
+| `build/make/core/product_config.mk` | 产品配置的加载与校验 |
+| `build/make/core/board_config.mk` | 板级硬件配置 |
+| `build/make/core/binary.mk` | 构建原生二进制文件的共享规则 |
+| `frameworks/libs/binary_translation/berberis_config.mk` | 用于原生桥接（native bridge）的 Berberis（riscv64 到 x86_64）产品包配置 |
+| `build/make/envsetup.sh` | Shell 环境设置；定义 `lunch`（以及 `tapas`、`banchan`、`croot`），并将 `build/soong/bin`（独立 `m`、`mm`、`mmm` 脚本的所在目录）加入 PATH |
+| `build/soong/cmd/soong_build/main.go` | Soong 构建系统入口 |
+| `build/soong/android/module.go` | Soong 的基础模块类型定义 |
+| `build/soong/android/androidmk.go` | 为 Soong 模块生成 Android.mk 条目，以便 Kati 使用（Make 与 Soong 互操作） |
+| `build/soong/cc/cc.go` | Soong 的 C/C++ 模块构建规则 |
+| `build/soong/cc/library.go` | 共享库/静态库构建规则 |
+| `build/soong/cc/binary.go` | 原生二进制文件构建规则 |
+| `build/soong/cc/config/riscv64_device.go` | RISC-V 64 位设备配置 |
+| `build/soong/java/java.go` | Soong 的 Java 模块构建规则 |
+| `build/soong/java/app.go` | Android 应用构建规则 |
+| `build/soong/apex/apex.go` | APEX 模块构建规则 |
+| `build/blueprint/context.go` | Blueprint 核心上下文与依赖解析 |
+| `build/blueprint/module_ctx.go` | Blueprint 的模块上下文接口 |
+| `device/generic/goldfish/board/BoardConfigCommon.mk` | 模拟器主板配置（通用） |
+| `device/google/cuttlefish/vsoc_x86_64/BoardConfig.mk` | Cuttlefish 虚拟设备主板配置（x86_64） |
+
+## 启动与初始化（第 4 章）
+
+| 文件路径 | 用途 |
+|-----------|---------|
+| `system/core/init/init.cpp` | PID-1 init 进程主入口 |
+| `system/core/init/service.cpp` | 服务生命周期管理（启动/停止/重启） |
+| `system/core/init/service_parser.cpp` | 解析 .rc 文件中的服务定义 |
+| `system/core/init/action.cpp` | Action 与触发器的执行引擎 |
+| `system/core/init/action_parser.cpp` | 解析 .rc 文件中的 action 代码块 |
+| `system/core/init/property_service.cpp` | 系统属性守护进程与持久化 |
+| `system/core/init/first_stage_init.cpp` | 挂载分区之前的第一阶段 init |
+| `system/core/init/first_stage_mount.cpp` | 早期分区挂载逻辑 |
+| `system/core/init/selinux.cpp` | init 期间的 SELinux 策略加载 |
+| `system/core/init/ueventd.cpp` | 设备节点创建守护进程 |
+| `system/core/init/reboot.cpp` | 关机与重启时序控制 |
+| `system/core/rootdir/init.rc` | 根 init 脚本；定义核心服务与触发器 |
+| `system/core/rootdir/init.zygote64_32.rc` | Zygote 启动配置（64+32 位） |
+| `system/core/fastboot/fastboot.cpp` | Fastboot 协议主机端实现 |
+| `bootable/recovery/recovery.cpp` | Recovery 模式主入口 |
+
+## 内核（第 5 章）
+
+与本附录其余部分不同，这些路径相对于单独的 Android Common Kernel 检出（其独立的 `repo init`）。在该检出中，内核源码树是 `common/`，构建工具是 `build/`。平台检出的 `kernel/` 目录只包含配置、预编译产物和测试。
+
+| 文件路径 | 用途 |
+|-----------|---------|
+| `common/Makefile` | 顶层内核 Makefile |
+| `common/arch/arm64/configs/gki_defconfig` | GKI 默认内核配置 |
+| `common/drivers/android/binder.c` | Binder 内核驱动实现 |
+| `common/drivers/android/binder_alloc.c` | Binder 内存分配 |
+| `common/drivers/staging/android/ion/` | ION 内存分配器（旧版） |
+| `common/drivers/dma-buf/` | 用于缓冲区共享的 DMA-BUF 框架 |
+| `common/drivers/gpu/drm/` | DRM/KMS 图形驱动框架 |
+| `common/include/uapi/linux/android/binder.h` | Binder UAPI 头文件 |
+| `common/fs/fuse/dev.c` | FUSE 设备实现（用于 scoped storage） |
+| `build/build.sh` | 内核构建包装脚本（旧版） |
+| `build/kleaf/` | Kleaf（基于 Bazel）的内核构建系统 |
+
+## Bionic 与动态链接器（第 7 章）
+
+| 文件路径 | 用途 |
+|-----------|---------|
+| `bionic/libc/bionic/malloc_common.cpp` | malloc 分发（jemalloc/scudo 选择） |
+| `bionic/libc/bionic/pthread_create.cpp` | POSIX 线程创建 |
+| `bionic/libc/bionic/libc_init_dynamic.cpp` | 动态链接进程启动 |
+| `bionic/libc/bionic/libc_init_static.cpp` | 静态链接进程启动 |
+| `bionic/libc/bionic/system_property_api.cpp` | 系统属性客户端 API |
+| `bionic/libc/arch-arm64/` | ARM64 架构特定代码 |
+| `bionic/libc/include/` | 公共 C 库头文件 |
+| `bionic/linker/linker.cpp` | 动态链接器主逻辑 |
+| `bionic/linker/linker_phdr.cpp` | ELF 程序头解析与加载 |
+| `bionic/linker/linker_namespaces.cpp` | 链接器命名空间实现 |
+| `bionic/linker/linker_soinfo.cpp` | 共享对象信息管理 |
+| `bionic/linker/linker_config.cpp` | 链接器配置文件解析 |
+| `system/core/rootdir/etc/ld.config.txt` | 默认链接器命名空间配置 |
+| `bionic/libm/` | 数学库实现 |
+| `bionic/libdl/libdl.cpp` | dlopen/dlsym 实现 |
+
+## Binder IPC（第 9 章）
+
+| 文件路径 | 用途 |
+|-----------|---------|
+| `frameworks/native/libs/binder/IPCThreadState.cpp` | 按线程处理 Binder 事务 |
+| `frameworks/native/libs/binder/ProcessState.cpp` | 按进程的 Binder 驱动状态 |
+| `frameworks/native/libs/binder/Binder.cpp` | BBinder（本地）基类 |
+| `frameworks/native/libs/binder/BpBinder.cpp` | BpBinder（代理）基类 |
+| `frameworks/native/libs/binder/Parcel.cpp` | Binder 事务的数据序列化 |
+| `frameworks/native/libs/binder/IServiceManager.cpp` | 服务管理器客户端接口 |
+| `frameworks/native/cmds/servicemanager/ServiceManager.cpp` | 服务管理器守护进程 |
+| `frameworks/native/cmds/servicemanager/main.cpp` | 服务管理器入口 |
+| `frameworks/base/core/java/android/os/Binder.java` | Java 侧 Binder 基类 |
+| `frameworks/base/core/java/android/os/BinderProxy.java` | Java 侧 Binder 代理 |
+| `frameworks/base/core/java/android/os/Parcel.java` | Java 侧 Parcel |
+| `frameworks/base/core/java/android/os/ServiceManager.java` | Java 服务管理器客户端 |
+| `frameworks/base/core/jni/android_util_Binder.cpp` | Binder JNI 桥接 |
+
+## HAL -- 硬件抽象层（第 10 章）
+
+| 文件路径 | 用途 |
+|-----------|---------|
+| `hardware/interfaces/` | 顶层 HIDL/AIDL HAL 接口目录 |
+| `hardware/interfaces/audio/aidl/` | 音频 HAL AIDL 接口定义 |
+| `hardware/interfaces/camera/provider/aidl/` | 相机提供者 HAL 接口 |
+| `hardware/interfaces/graphics/composer/aidl/` | HWC（Hardware Composer）HAL 接口 |
+| `hardware/interfaces/graphics/allocator/aidl/` | Gralloc 分配器 HAL 接口 |
+| `hardware/interfaces/graphics/mapper/stable-c/` | Gralloc mapper stable-C HAL 接口 |
+| `hardware/interfaces/health/aidl/` | 电池/健康 HAL 接口 |
+| `hardware/interfaces/sensors/aidl/` | 传感器 HAL 接口 |
+| `hardware/interfaces/neuralnetworks/aidl/` | NNAPI HAL 接口 |
+| `hardware/interfaces/power/aidl/` | 电源 HAL 接口 |
+| `hardware/interfaces/thermal/aidl/` | 热管理 HAL 接口 |
+| `hardware/interfaces/bluetooth/aidl/` | 蓝牙 HAL 接口 |
+| `hardware/interfaces/wifi/aidl/` | Wi-Fi HAL 接口 |
+| `hardware/interfaces/vibrator/aidl/` | 振动器 HAL 接口 |
+| `hardware/libhardware/include/hardware/hardware.h` | 传统 HAL 模块接口（hw_module_t） |
+| `system/libhidl/transport/HidlTransportSupport.cpp` | HIDL 传输初始化 |
+| `system/tools/hidl/` | HIDL 编译器（hidl-gen） |
+| `system/tools/aidl/` | 用于 HAL 接口的 AIDL 编译器 |
+
+## NDK -- 原生开发套件（第 11 章）
+
+| 文件路径 | 用途 |
+|-----------|---------|
+| `frameworks/native/include/android/` | 公共 NDK 原生头文件 |
+| `frameworks/native/libs/nativewindow/include/android/native_window.h` | ANativeWindow API |
+| `frameworks/native/include/android/native_activity.h` | NativeActivity API |
+| `frameworks/native/include/android/sensor.h` | 传感器 NDK API |
+| `frameworks/native/include/android/asset_manager.h` | Asset 管理器 NDK API |
+| `frameworks/av/media/ndk/` | 媒体 NDK 实现（AMediaCodec 等） |
+| `packages/modules/NeuralNetworks/runtime/` | NNAPI 运行时实现 |
+| `frameworks/native/libs/nativewindow/` | ANativeWindow 实现 |
+
+## 原生服务（第 12 章）
+
+| 文件路径 | 用途 |
+|-----------|---------|
+| `frameworks/native/services/inputflinger/dispatcher/InputDispatcher.cpp` | 输入事件分发到窗口 |
+| `frameworks/native/services/inputflinger/reader/InputReader.cpp` | 输入设备事件读取 |
+| `frameworks/native/services/inputflinger/InputManager.cpp` | 输入子系统协调器 |
+| `frameworks/native/services/sensorservice/SensorService.cpp` | 传感器事件多路复用 |
+| `frameworks/native/services/surfaceflinger/main_surfaceflinger.cpp` | SurfaceFlinger 进程入口 |
+| `system/logging/logd/SerializedLogBuffer.cpp` | 系统日志环形缓冲区 |
+| `system/memory/lmkd/lmkd.cpp` | 低内存杀手守护进程 |
+| `system/memory/lmkd/` | 现代 LMKD 实现 |
+| `system/core/healthd/` | 电池/健康守护进程 |
+| `system/netd/server/NetdNativeService.cpp` | 网络守护进程原生服务 |
+
+## 图形与渲染管线（第 13 章）
+
+| 文件路径 | 用途 |
+|-----------|---------|
+| `frameworks/native/services/surfaceflinger/SurfaceFlinger.cpp` | 合成器主类 |
+| `frameworks/native/services/surfaceflinger/SurfaceFlinger.h` | SurfaceFlinger 声明 |
+| `frameworks/native/services/surfaceflinger/Scheduler/Scheduler.cpp` | VSYNC 调度与帧节奏控制 |
+| `frameworks/native/services/surfaceflinger/Scheduler/VSyncReactor.cpp` | VSYNC 控制器实现（`VsyncController.h` 中的 `VsyncController` 接口） |
+| `frameworks/native/services/surfaceflinger/CompositionEngine/` | 合成策略引擎 |
+| `frameworks/native/services/surfaceflinger/DisplayHardware/HWComposer.cpp` | HWC 抽象层 |
+| `frameworks/native/services/surfaceflinger/PowerAdvisor/PowerAdvisor.cpp` | 电源提示集成 |
+| `frameworks/native/services/surfaceflinger/Layer.cpp` | 单个 surface/图层管理 |
+| `frameworks/native/services/surfaceflinger/FrontEnd/LayerSnapshot.cpp` | 基于缓冲区的图层状态快照（前端） |
+| `frameworks/native/services/surfaceflinger/FrontEnd/LayerLifecycleManager.cpp` | 图层生命周期跟踪 |
+| `frameworks/native/services/surfaceflinger/Tracing/TransactionTracing.cpp` | 事务跟踪捕获 |
+| `frameworks/native/libs/gui/Surface.cpp` | 客户端 Surface 实现 |
+| `frameworks/native/libs/gui/BufferQueue.cpp` | 生产者-消费者缓冲区队列 |
+| `frameworks/native/libs/gui/BufferQueueProducer.cpp` | 缓冲区队列生产者端 |
+| `frameworks/native/libs/gui/BufferQueueConsumer.cpp` | 缓冲区队列消费者端 |
+| `frameworks/native/libs/gui/SurfaceComposerClient.cpp` | SurfaceFlinger 客户端接口 |
+| `frameworks/native/libs/gui/BLASTBufferQueue.cpp` | BLAST 缓冲区队列（现代路径） |
+| `frameworks/native/libs/renderengine/skia/SkiaGLRenderEngine.cpp` | 基于 Skia 的 GPU 合成 |
+| `frameworks/native/libs/renderengine/skia/SkiaVkRenderEngine.cpp` | Skia Vulkan 渲染引擎 |
+| `frameworks/native/opengl/libs/EGL/eglApi.cpp` | EGL API 入口点 |
+| `frameworks/native/opengl/libs/EGL/Loader.cpp` | EGL 驱动加载器 |
+| `frameworks/native/vulkan/libvulkan/driver.cpp` | Vulkan 加载器/驱动接口 |
+| `frameworks/native/vulkan/libvulkan/api.cpp` | Vulkan API 分发 |
+| `external/skia/src/gpu/ganesh/GrDirectContext.cpp` | Skia GPU 上下文 |
+| `external/skia/src/gpu/graphite/` | Skia Graphite（下一代 GPU 后端） |
+| `frameworks/base/libs/hwui/renderthread/RenderThread.cpp` | HWUI 渲染线程 |
+| `frameworks/base/libs/hwui/renderthread/CanvasContext.cpp` | 每个窗口的渲染上下文 |
+| `frameworks/base/libs/hwui/pipeline/skia/SkiaOpenGLPipeline.cpp` | Skia GL 渲染管线 |
+| `frameworks/base/libs/hwui/pipeline/skia/SkiaVulkanPipeline.cpp` | Skia Vulkan 渲染管线 |
+| `frameworks/base/libs/hwui/RenderNode.cpp` | Display list 渲染节点 |
+| `frameworks/base/libs/hwui/RecordingCanvas.cpp` | Display list 录制画布 |
+| `frameworks/base/libs/hwui/DamageAccumulator.cpp` | 脏区跟踪 |
+| `frameworks/base/libs/hwui/JankTracker.cpp` | 掉帧检测与报告 |
+| `frameworks/base/graphics/java/android/graphics/Canvas.java` | Java Canvas API |
+| `frameworks/base/graphics/java/android/graphics/RenderNode.java` | Java RenderNode API |
+| `frameworks/base/core/java/android/view/Choreographer.java` | 基于 VSYNC 的回调调度器 |
+| `frameworks/base/core/java/android/view/ViewRootImpl.java` | 视图层级的根节点；驱动测量/布局/绘制 |
+| `frameworks/base/core/java/android/view/ThreadedRenderer.java` | 通往 HWUI RenderThread 的 Java 桥接 |
+
+## 动画系统（第 14 章）
+
+| 文件路径 | 用途 |
+|-----------|---------|
+| `frameworks/base/core/java/android/animation/ValueAnimator.java` | 核心属性动画引擎 |
+| `frameworks/base/core/java/android/animation/ObjectAnimator.java` | 针对属性的动画 |
+| `frameworks/base/core/java/android/animation/AnimatorSet.java` | 协调的动画序列编排 |
+| `frameworks/base/core/java/android/view/animation/Animation.java` | 传统视图动画基类 |
+| `frameworks/base/core/java/android/transition/TransitionManager.java` | 场景过渡框架 |
+| `frameworks/base/core/java/android/window/TransitionInfo.java` | 系统 Shell 过渡元数据 |
+| `frameworks/libs/systemui/animationlib/src/` | SystemUI 共享动画库 |
+
+## 音频系统（第 15 章）
+
+| 文件路径 | 用途 |
+|-----------|---------|
+| `frameworks/av/services/audioflinger/AudioFlinger.cpp` | 音频混合守护进程主类 |
+| `frameworks/av/services/audioflinger/Threads.cpp` | 播放与录音线程实现 |
+| `frameworks/av/services/audioflinger/Tracks.cpp` | 音频轨道管理 |
+| `frameworks/av/services/audioflinger/Effects.cpp` | 音频效果链处理 |
+| `frameworks/av/services/audiopolicy/managerdefault/AudioPolicyManager.cpp` | 音频路由策略 |
+| `frameworks/av/services/audiopolicy/common/managerdefinitions/src/PolicyAudioPort.cpp` | 音频端口抽象 |
+| `frameworks/av/media/libaudioclient/AudioTrack.cpp` | 客户端音频播放 |
+| `frameworks/av/media/libaudioclient/AudioRecord.cpp` | 客户端音频录音 |
+| `frameworks/av/media/libaudioclient/AudioSystem.cpp` | 音频系统客户端接口 |
+| `frameworks/av/media/libaudiohal/impl/DeviceHalAidl.cpp` | 音频设备 HAL AIDL 适配器 |
+| `frameworks/base/media/java/android/media/AudioTrack.java` | Java 音频播放 API |
+| `frameworks/base/services/core/java/com/android/server/audio/AudioService.java` | 音频服务（音量、路由） |
+
+## 媒体与视频管线（第 16 章）
+
+| 文件路径 | 用途 |
+|-----------|---------|
+| `frameworks/av/media/libmediaplayerservice/MediaPlayerService.cpp` | 媒体播放器守护进程 |
+| `frameworks/av/media/codec2/sfplugin/CCodec.cpp` | Codec2 框架插件 |
+| `frameworks/av/media/codec2/sfplugin/CCodecBufferChannel.cpp` | Codec2 缓冲区管理 |
+| `frameworks/av/media/codec2/components/` | 软件编解码器实现 |
+| `frameworks/av/media/libstagefright/MediaCodec.cpp` | MediaCodec 原生实现 |
+| `frameworks/av/media/libstagefright/ACodec.cpp` | 传统 OMX 编解码器适配器 |
+| `frameworks/av/media/libmediaplayerservice/nuplayer/NuPlayer.cpp` | 媒体播放引擎 |
+| `frameworks/av/media/module/extractors/` | 媒体文件格式提取器（MP4、MKV 等） |
+| `frameworks/av/services/camera/libcameraservice/CameraService.cpp` | 相机服务守护进程 |
+| `frameworks/av/drm/mediadrm/plugins/clearkey/` | ClearKey DRM 参考实现 |
+| `frameworks/base/media/java/android/media/MediaCodec.java` | Java MediaCodec API |
+| `frameworks/base/media/java/android/media/MediaPlayer.java` | Java MediaPlayer API |
+
+## ART 运行时（第 18 章）
+
+| 文件路径 | 用途 |
+|-----------|---------|
+| `art/runtime/runtime.cc` | ART 运行时初始化 |
+| `art/runtime/class_linker.cc` | 类加载与链接 |
+| `art/runtime/interpreter/interpreter.cc` | 字节码解释器入口 |
+| `art/runtime/jit/jit.cc` | JIT 编译器协调器 |
+| `art/runtime/jit/jit_code_cache.cc` | JIT 编译代码缓存 |
+| `art/runtime/gc/heap.cc` | 垃圾回收器堆管理 |
+| `art/runtime/gc/collector/concurrent_copying.cc` | 并发复制 GC |
+| `art/runtime/thread.cc` | 线程管理 |
+| `art/runtime/oat/oat_file.cc` | OAT 文件格式处理 |
+| `art/runtime/mirror/object.h` | 托管堆的根对象类型 |
+| `art/runtime/mirror/class.h` | 类元数据表示 |
+| `art/compiler/optimizing/optimizing_compiler.cc` | AOT/JIT 优化编译器 |
+| `art/compiler/optimizing/code_generator_arm64.cc` | ARM64 代码生成后端 |
+| `art/compiler/optimizing/register_allocator_linear_scan.cc` | 寄存器分配 |
+| `art/dex2oat/dex2oat.cc` | 提前编译工具 |
+| `art/dex2oat/dex2oat_options.cc` | DEX 到 OAT 的编译选项 |
+| `art/libdexfile/dex/dex_file.h` | DEX 文件格式定义 |
+| `art/runtime/native_bridge_art_interface.cc` | ART 侧的原生桥接集成 |
+
+## 原生桥接与二进制翻译（第 19 章）
+
+| 文件路径 | 用途 |
+|-----------|---------|
+| `frameworks/libs/binary_translation/native_bridge/native_bridge.h` | NativeBridgeCallbacks 接口（v3-v8） |
+| `frameworks/libs/binary_translation/native_bridge/native_bridge.cc` | 原生桥接框架实现 |
+| `frameworks/libs/binary_translation/guest_loader/` | 客户库加载与链接 |
+| `frameworks/libs/binary_translation/guest_abi/` | 宿主与客户之间的 ABI 转换 |
+| `frameworks/libs/binary_translation/guest_state/` | 客户 CPU 状态抽象 |
+| `frameworks/libs/binary_translation/jni/` | JNI 跳板生成 |
+| `frameworks/libs/binary_translation/cpu_emulation/interpreter/` | 客户指令解释器 |
+| `frameworks/libs/binary_translation/cpu_emulation/decoder/` | 客户指令解码器 |
+| `frameworks/libs/binary_translation/cpu_emulation/backend/` | 宿主代码生成后端 |
+| `frameworks/libs/binary_translation/cpu_emulation/assembler/` | 宿主指令汇编器 |
+| `frameworks/libs/binary_translation/android_api/` | Android 框架代理存根 |
+| `frameworks/libs/native_bridge_support/native_bridge_support.mk` | 桥接支持的构建同步 |
+| `art/libnativebridge/native_bridge.cc` | 系统侧的原生桥接加载 |
+
+## system_server（第 20 章）
+
+| 文件路径 | 用途 |
+|-----------|---------|
+| `frameworks/base/services/java/com/android/server/SystemServer.java` | system_server 启动序列 |
+| `frameworks/base/services/core/java/com/android/server/SystemServiceManager.java` | 服务生命周期管理器 |
+| `frameworks/base/services/core/java/com/android/server/am/ActivityManagerService.java` | Activity Manager Service |
+| `frameworks/base/services/core/java/com/android/server/wm/WindowManagerService.java` | Window Manager Service |
+| `frameworks/base/services/core/java/com/android/server/wm/ActivityTaskManagerService.java` | Activity Task Manager Service |
+| `frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java` | Package Manager Service |
+| `frameworks/base/services/core/java/com/android/server/power/PowerManagerService.java` | 电源管理 |
+| `frameworks/base/services/core/java/com/android/server/display/DisplayManagerService.java` | 显示管理 |
+| `frameworks/base/services/core/java/com/android/server/input/InputManagerService.java` | 输入管理桥接 |
+| `frameworks/base/core/java/com/android/internal/os/ZygoteInit.java` | Zygote 进程初始化 |
+| `frameworks/base/core/java/com/android/internal/os/ZygoteConnection.java` | Zygote fork 请求处理 |
+| `frameworks/base/core/java/com/android/internal/os/Zygote.java` | Zygote fork 机制 |
+| `frameworks/base/core/java/com/android/internal/os/RuntimeInit.java` | 应用进程运行时初始化 |
+
+## Activity 与窗口管理（第 22 章）
+
+| 文件路径 | 用途 |
+|-----------|---------|
+| `frameworks/base/services/core/java/com/android/server/wm/Task.java` | Task（返回栈）容器 |
+| `frameworks/base/services/core/java/com/android/server/wm/ActivityRecord.java` | 每个 Activity 的状态跟踪 |
+| `frameworks/base/services/core/java/com/android/server/wm/ActivityStarter.java` | Intent 解析与 Activity 启动 |
+| `frameworks/base/services/core/java/com/android/server/wm/ActivityClientController.java` | Activity 生命周期 IPC 处理器 |
+| `frameworks/base/services/core/java/com/android/server/wm/RootWindowContainer.java` | 窗口层级的根 |
+| `frameworks/base/services/core/java/com/android/server/wm/TaskFragment.java` | Activity 嵌入容器 |
+| `frameworks/base/core/java/android/app/Activity.java` | 应用侧 Activity 基类 |
+| `frameworks/base/core/java/android/app/ActivityThread.java` | 每个 Android 应用的主线程 |
+| `frameworks/base/core/java/android/app/Instrumentation.java` | Activity 生命周期插桩钩子 |
+
+## 窗口系统（第 23 章）
+
+| 文件路径 | 用途 |
+|-----------|---------|
+| `frameworks/base/services/core/java/com/android/server/wm/WindowState.java` | 每个窗口的服务端状态 |
+| `frameworks/base/services/core/java/com/android/server/wm/WindowToken.java` | 窗口分组令牌 |
+| `frameworks/base/services/core/java/com/android/server/wm/Session.java` | 每个应用的 WMS 会话 |
+| `frameworks/base/services/core/java/com/android/server/wm/WindowStateAnimator.java` | 窗口到 Surface 的桥接；创建并管理窗口的 SurfaceControl |
+| `frameworks/base/services/core/java/com/android/server/wm/WindowAnimator.java` | 窗口动画协调器 |
+| `frameworks/base/services/core/java/com/android/server/wm/InsetsStateController.java` | 系统 Insets 管理 |
+| `frameworks/base/services/core/java/com/android/server/wm/InsetsPolicy.java` | Insets 可见性策略 |
+| `frameworks/base/core/java/android/view/WindowManager.java` | 客户端窗口管理器接口 |
+| `frameworks/base/core/java/android/view/WindowManagerImpl.java` | 窗口管理器实现 |
+| `frameworks/base/core/java/android/view/View.java` | 基础 UI 组件（测量/布局/绘制） |
+| `frameworks/base/core/java/android/view/ViewGroup.java` | 子视图容器 |
+| `frameworks/base/core/java/android/view/SurfaceView.java` | 独立 Surface 的视图组件 |
+
+## 显示系统（第 24 章）
+
+| 文件路径 | 用途 |
+|-----------|---------|
+| `frameworks/base/services/core/java/com/android/server/wm/DisplayContent.java` | 每个显示器的窗口容器 |
+| `frameworks/base/services/core/java/com/android/server/wm/DisplayPolicy.java` | 每个显示器的窗口策略（状态栏、挖孔） |
+| `frameworks/base/services/core/java/com/android/server/wm/DisplayRotation.java` | 显示器旋转处理 |
+| `frameworks/base/services/core/java/com/android/server/display/LogicalDisplay.java` | 逻辑显示器抽象 |
+| `frameworks/base/services/core/java/com/android/server/display/DisplayDeviceInfo.java` | 物理显示器属性 |
+| `frameworks/base/services/core/java/com/android/server/display/LocalDisplayAdapter.java` | 内置显示器适配器 |
+
+## PackageManagerService（第 26 章）
+
+| 文件路径 | 用途 |
+|-----------|---------|
+| `frameworks/base/services/core/java/com/android/server/pm/PackageManagerService.java` | 包管理核心 |
+| `frameworks/base/services/core/java/com/android/server/pm/Settings.java` | 包设置持久化 |
+| `frameworks/base/services/core/java/com/android/server/pm/InstallPackageHelper.java` | 包安装逻辑 |
+| `frameworks/base/services/core/java/com/android/server/pm/PackageInstallerService.java` | 安装器会话管理 |
+| `frameworks/base/services/core/java/com/android/server/pm/permission/PermissionManagerService.java` | 运行时权限管理 |
+| `frameworks/base/core/java/com/android/internal/pm/pkg/parsing/ParsingPackageUtils.java` | APK 清单解析 |
+| `frameworks/base/services/core/java/com/android/server/pm/resolution/ComponentResolver.java` | Intent 过滤器解析 |
+| `frameworks/base/services/core/java/com/android/server/pm/dex/ArtManagerService.java` | ART profile 与 DEX 优化服务 |
+| `frameworks/base/core/java/android/content/pm/PackageManager.java` | 公共 PackageManager API |
+
+## 安全（第 40 章）
+
+| 文件路径 | 用途 |
+|-----------|---------|
+| `system/sepolicy/public/` | 公共 SELinux 策略定义 |
+| `system/sepolicy/private/` | 私有（平台）SELinux 策略 |
+| `system/sepolicy/vendor/` | 厂商 SELinux 策略 |
+| `system/security/keystore2/` | Keystore2 服务（Rust） |
+| `system/security/identity/` | 身份凭据服务 |
+| `external/selinux/` | SELinux 用户空间工具 |
+| `system/extras/verity/` | dm-verity 工具 |
+| `system/fs/fs_mgr/libfs_avb/` | AVB（Android Verified Boot）集成 |
+| `frameworks/base/services/core/java/com/android/server/biometrics/` | 生物识别认证 |
+| `frameworks/base/keystore/java/android/security/keystore2/` | Keystore Java API |
+
+## SystemUI（第 48 章）
+
+| 文件路径 | 用途 |
+|-----------|---------|
+| `frameworks/base/packages/SystemUI/src/com/android/systemui/application/SystemUIApplication.kt` | SystemUI 应用入口 |
+| `frameworks/base/packages/SystemUI/src/com/android/systemui/statusbar/phone/CentralSurfacesImpl.java` | 状态栏 + 通知面板（下拉阴影） |
+| `frameworks/base/packages/SystemUI/src/com/android/systemui/qs/panels/domain/startable/QSPanelsCoreStartable.kt` | 快速设置面板启动协调器 |
+| `frameworks/base/packages/SystemUI/src/com/android/systemui/recents/OverviewProxyRecentsImpl.java` | 向 Launcher 提供的最近任务/概览代理 |
+| `frameworks/base/packages/SystemUI/src/com/android/systemui/keyguard/KeyguardViewMediator.java` | 锁屏协调器 |
+| `frameworks/base/packages/SystemUI/src/com/android/systemui/navigationbar/views/NavigationBar.java` | 导航栏 |
+| `frameworks/base/packages/SystemUI/src/com/android/systemui/volume/VolumeDialogControllerImpl.java` | 音量对话框逻辑 |
+| `frameworks/base/packages/SystemUI/src/com/android/systemui/shade/NotificationPanelViewController.java` | 通知面板控制器 |
+
+## Launcher3（第 49 章）
+
+| 文件路径 | 用途 |
+|-----------|---------|
+| `packages/apps/Launcher3/src/com/android/launcher3/Launcher.java` | 主 Launcher Activity |
+| `packages/apps/Launcher3/src/com/android/launcher3/Workspace.java` | 主屏工作区 |
+| `packages/apps/Launcher3/src/com/android/launcher3/allapps/ActivityAllAppsContainerView.java` | 全部应用抽屉 |
+| `packages/apps/Launcher3/src/com/android/launcher3/model/LoaderTask.java` | 应用列表加载 |
+| `packages/apps/Launcher3/src/com/android/launcher3/dragndrop/DragController.java` | 拖放协调器 |
+| `packages/apps/Launcher3/quickstep/src/com/android/quickstep/RecentsActivity.java` | 最近任务（概览）Activity |
+| `packages/apps/Launcher3/quickstep/src/com/android/quickstep/TouchInteractionService.kt` | 手势导航服务 |
+
+## 设置应用（第 50 章）
+
+| 文件路径 | 用途 |
+|-----------|---------|
+| `packages/apps/Settings/src/com/android/settings/Settings.java` | 设置主 Activity |
+| `packages/apps/Settings/src/com/android/settings/dashboard/DashboardFragment.java` | 偏好设置面板基类 |
+| `packages/apps/Settings/src/com/android/settings/search/SearchFeatureProvider.java` | 设置搜索 |
+| `packages/apps/Settings/src/com/android/settings/biometrics/` | 生物识别注册 |
+
+## CompanionDeviceManager 与虚拟设备（第 52 章）
+
+| 文件路径 | 用途 |
+|-----------|---------|
+| `frameworks/base/services/companion/java/com/android/server/companion/CompanionDeviceManagerService.java` | CDM 服务 |
+| `frameworks/base/services/companion/java/com/android/server/companion/virtual/VirtualDeviceManagerService.java` | VDM 服务 |
+
+## Mainline 模块（第 54 章）
+
+| 文件路径 | 用途 |
+|-----------|---------|
+| `packages/modules/Wifi/` | Wi-Fi Mainline 模块 |
+| `packages/modules/Bluetooth/` | 蓝牙 Mainline 模块 |
+| `packages/modules/NetworkStack/` | 网络栈 Mainline 模块 |
+| `packages/modules/Permission/` | 权限控制器模块 |
+| `packages/providers/MediaProvider/` | 媒体存储提供者模块 |
+| `packages/modules/adb/` | ADB Mainline 模块 |
+| `packages/modules/common/` | 共享 Mainline 模块基础设施 |
+| `system/apex/apexd/` | APEX 守护进程（模块安装器） |
+| `system/apex/apexd/apexd.cpp` | APEX 安装与激活 |
+| `system/apex/libs/libapexutil/` | APEX 工具库 |
+
+## 虚拟化框架（第 56 章）
+
+| 文件路径 | 用途 |
+|-----------|---------|
+| `packages/modules/Virtualization/` | Android 虚拟化框架顶层 |
+| `packages/modules/Virtualization/android/virtualizationservice/` | VM 生命周期管理 |
+| `packages/modules/Virtualization/build/microdroid/` | 最小客户操作系统（Microdroid）构建文件 |
+| `packages/modules/Virtualization/guest/pvmfw/` | 受保护 VM 固件 |
+| `packages/modules/Virtualization/libs/libvm_payload/` | 客户负载接口 |
+
+## 测试（第 57 章）
+
+| 文件路径 | 用途 |
+|-----------|---------|
+| `test/vts/` | Vendor Test Suite 顶层 |
+| `cts/tests/` | 兼容性测试套件测试 |
+| `tools/tradefederation/core/` | Trade Federation 测试框架核心 |
+| `tools/tradefederation/core/src/com/android/tradefed/` | TradeFed 框架类 |
+| `platform_testing/tests/` | 平台集成测试 |
+| `frameworks/base/core/tests/` | 框架核心单元测试 |
+| `frameworks/base/test-runner/` | Android 测试运行器框架 |
+
+## 架构支持（第 59 章）
+
+| 文件路径 | 用途 |
+|-----------|---------|
+| `build/soong/cc/config/arm64_device.go` | ARM64 工具链：架构变体、CPU 调优、PAC/BTI |
+| `build/soong/cc/config/arm_device.go` | ARM 32 位工具链：Thumb/ARM、勘误变通方案 |
+| `build/soong/cc/config/x86_device.go` | x86 32 位工具链：SSE、栈重对齐 |
+| `build/soong/cc/config/x86_64_device.go` | x86_64 工具链：微架构变体 |
+| `build/soong/cc/config/riscv64_device.go` | RISC-V 64 位工具链：ISA 扩展 |
+| `build/soong/cc/config/toolchain.go` | 工具链接口与工厂注册表 |
+| `build/soong/cc/config/global.go` | 所有架构的全局编译器/链接器标志 |
+| `build/soong/cc/config/bionic.go` | Bionic CRT 对象与默认共享库 |
+| `build/soong/cc/config/clang.go` | Clang 未知标志过滤器 |
+| `build/soong/android/arch.go` | Arch 结构体、ArchType、multilib 解码逻辑 |
+| `bionic/libc/arch-arm64/ifuncs.cpp` | ARM64 ifunc 分发器（MTE 变体选择；SVE 变体已存在但尚未启用） |
+| `art/runtime/arch/riscv64/instruction_set_features_riscv64.h` | ART RISC-V 特性检测 |
+| `art/runtime/arch/arm64/instruction_set_features_arm64.h` | ART ARM64 特性位图与勘误 |
+
+## 模拟器（第 60 章）
+
+| 文件路径 | 用途 |
+|-----------|---------|
+| `external/qemu/android-qemu2-glue/emulation/` | QEMU 与 android-emu 模拟层之间的胶水层 |
+| `external/qemu/android/android-emu/android/emulation/` | 模拟器硬件模拟 |
+| `device/generic/goldfish/` | Goldfish 虚拟设备定义 |
+| `device/google/cuttlefish/` | Cuttlefish 虚拟设备定义 |
+| `device/google/cuttlefish/host/commands/run_cvd/` | Cuttlefish 启动器 |
+| `external/crosvm/` | CrosVM 虚拟机监控器 |
+| `external/qemu/android/android-grpc/` | 模拟器 gRPC 控制接口 |
+
+## 设备形态（第 62 章）
+
+| 文件路径 | 用途 |
+|-----------|---------|
+| `packages/services/Car/` | Android Automotive 服务层 |
+| `packages/services/Car/service/src/com/android/car/CarServiceImpl.java` | 车载汽车服务 |
+| `packages/apps/Car/Launcher/` | 车载启动器 |
+| `device/google/atv/` | Android TV 设备配置 |
+| `packages/apps/TvSettings/` | TV 设置应用 |
+| `prebuilts/sdk/opt/wear/` | Wear OS SDK 预编译产物 |
+
+---
+
+> **注意**：路径可能随 AOSP 分支不同而变化。上述路径针对 2026 年初的 AOSP `main` 分支。请使用 `find` 或 `cs.android.com` 对照你检出的分支进行验证。
