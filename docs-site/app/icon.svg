@@ -1,0 +1,44 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#3DDC84"/>
+      <stop offset="100%" stop-color="#0E9F6E"/>
+    </linearGradient>
+  </defs>
+
+  <!-- rounded square background -->
+  <rect width="512" height="512" rx="116" fill="url(#bg)"/>
+
+  <!-- antennae -->
+  <g stroke="#ffffff" stroke-width="15" stroke-linecap="round">
+    <line x1="199" y1="120" x2="175" y2="76"/>
+    <line x1="313" y1="120" x2="337" y2="76"/>
+  </g>
+
+  <!-- robot head (dome) -->
+  <path d="M 156 194 C 156 140 201 100 256 100 C 311 100 356 140 356 194 Z" fill="#ffffff"/>
+
+  <!-- eyes -->
+  <circle cx="215" cy="156" r="14" fill="#12A96F"/>
+  <circle cx="297" cy="156" r="14" fill="#12A96F"/>
+
+  <!-- open book: single continuous silhouette with rounded corners -->
+  <path d="M 256 254 L 168 272 L 168 368 L 256 390 L 344 368 L 344 272 Z"
+        fill="#ffffff" stroke="#ffffff" stroke-width="17" stroke-linejoin="round"/>
+
+  <!-- spine crease -->
+  <line x1="256" y1="262" x2="256" y2="384" stroke="#0E9F6E" stroke-width="9" stroke-linecap="round"/>
+
+  <!-- text lines -->
+  <g stroke="#0E9F6E" stroke-width="9" stroke-linecap="round" fill="none">
+    <line x1="190" y1="304" x2="228" y2="296"/>
+    <line x1="190" y1="326" x2="228" y2="318"/>
+    <line x1="190" y1="348" x2="228" y2="340"/>
+    <line x1="284" y1="296" x2="312" y2="302"/>
+    <line x1="284" y1="318" x2="312" y2="324"/>
+    <line x1="284" y1="340" x2="312" y2="346"/>
+  </g>
+
+  <!-- red bookmark ribbon -->
+  <path d="M 314 240 L 334 240 L 334 322 L 324 307 L 314 322 Z" fill="#EF4444"/>
+</svg>
